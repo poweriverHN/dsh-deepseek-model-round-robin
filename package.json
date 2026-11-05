@@ -7,6 +7,7 @@
   "description": "Rotate the DeepSeek model of each dsh conversation to the next entry of a patrol-maintained allowlist after every turn, so no single free channel is drained first.",
   "files": [
     "index.js",
+    "test.js",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -34,5 +35,8 @@
   },
   "bugs": {
     "url": "https://github.com/poweriverHN/dsh-deepseek-model-round-robin/issues"
+  },
+  "scripts": {
+    "test": "node --test"
   }
 }
