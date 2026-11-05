@@ -1,0 +1,38 @@
+{
+  "name": "dsh-deepseek-model-round-robin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "Rotate the DeepSeek model of each dsh conversation to the next entry of a patrol-maintained allowlist after every turn, so no single free channel is drained first.",
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "model-rotation",
+    "round-robin",
+    "deepseek",
+    "rate-limit"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "author": "poweriverHN <poweriver@163.com>",
+  "homepage": "https://github.com/poweriverHN/dsh-deepseek-model-round-robin#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/poweriverHN/dsh-deepseek-model-round-robin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/poweriverHN/dsh-deepseek-model-round-robin/issues"
+  }
+}
