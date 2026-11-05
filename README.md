@@ -8,9 +8,10 @@
 
 | 场景 | 结果 |
 | --- | --- |
-| 当前模型在白名单里 | 切到列表里的下一个（末尾回到开头） |
-| 当前模型不在白名单里 | 从白名单第一个开始 |
-| 白名单只有一个模型 | 不轮换 |
+| 当前模型在免费池里 | 切到池里的下一个（末尾回到开头） |
+| 当前模型是付费/官方模型 | 切到池里第一个，**绝不从付费模型继续往下轮** |
+| 付费/官方渠道 | 默认不参与轮换，仍可手动选 |
+| 轮换池排完只剩 0 或 1 个 | 不轮换 |
 | 白名单缺失 / 过期 / 解析失败 | 保持当前模型不变 |
 | 子代理（subagent） | 默认跳过，不轮换 |
 | 任何异常 | 静默吞掉，绝不影响对话 |
@@ -42,10 +43,11 @@ plugin_manager  action=install_bundle  target=link:/path/to/dsh-deepseek-model-r
 {
   "at": 1793846236768,
   "staleAfterMinutes": 180,
+  "rotateExclude": ["deepseek-official", "deepseek-account", "codearts"],
   "models": [
-    { "provider": "codearts", "model": "deepseek-v4.1-flash" },
     { "provider": "trae", "model": "DeepSeek-V4-Pro" },
-    { "provider": "loomy", "model": "deepseek-v4-flash-0731" }
+    { "provider": "loomy", "model": "deepseek-v4-flash-0731" },
+    { "provider": "raccoon", "model": "sn-deepseek-v4-1-flash" }
   ]
 }
 ```
@@ -54,16 +56,33 @@ plugin_manager  action=install_bundle  target=link:/path/to/dsh-deepseek-model-r
 | --- | --- |
 | `at` | 巡检完成时间戳（毫秒）。超过 `staleAfterMinutes` 后白名单失效，不轮换 |
 | `staleAfterMinutes` | 过期阈值，缺省 180 |
+| `rotateExclude` | 不参与轮换的渠道；缺省 `["deepseek-official","deepseek-account","codearts"]` |
 | `models[].provider` | 渠道 id；省略时退化为用模型 id 当渠道 id |
 | `models[].model` | 模型 id |
 
-`models` 的顺序就是轮换顺序。
+`models` 的顺序就是轮换顺序。`rotateExclude` 里的渠道会先被踢掉，剩下的才参与轮换。
+
+## 付费渠道为什么不轮换
+
+轮换的初衷是别把单一免费渠道的额度薅干。付费/官方渠道一旦被自动切进去，就会在你不注意的时候产生真实费用 —— 这跟初衷相反。
+
+所以默认把 `deepseek-official`、`deepseek-account`、`codearts` 排除在轮换池外。它们在选择器里照常可见、随时可以手动选，只是不会被自动切过去。
+
+需要让付费渠道也参与轮换时：
+
+```yaml
+config:
+  excludeProviders: []        # 空数组 = 不排除任何渠道
+```
+
+或在白名单里把 `rotateExclude` 写成 `[]`。两者都省略时用内置默认。
 
 ## 配置
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `whitelistPath` | 见下 | 白名单路径 |
+| `excludeProviders` | 见下 | 不参与轮换的渠道；省略时读白名单 `rotateExclude`，再缺省用三个付费渠道 |
 | `includeSubagents` | `false` | 设为 `true` 让子代理也参与轮换 |
 | `statePrefix` | `round-robin` | debug 日志前缀 |
 
@@ -75,6 +94,7 @@ plugin_manager  action=install_bundle  target=link:/path/to/dsh-deepseek-model-r
       name: 'dsh-deepseek-model-round-robin'
       config:
         whitelistPath: /home/me/patrol/whitelist.json
+        excludeProviders: ['deepseek-official', 'deepseek-account', 'codearts']
         includeSubagents: false
 ```
 
