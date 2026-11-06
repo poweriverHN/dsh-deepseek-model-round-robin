@@ -48,7 +48,10 @@ function indexOf(list, current) {
 }
 
 export const name = 'deepseek-model-round-robin'
-export const inject = { required: ['agents'], optional: ['subagents'] }
+// 只硬依赖 agents。subagents 是可选能力：装配里没有它时用 ctx.get() 拿不到，
+// 就当作没有子代理概念、一律轮换。写成 cordis 的 {required, optional} 是不行的——
+// 那是「服务名 → 拦截配置」的映射，会变成等两个不存在的服务，插件永远 pending。
+export const inject = ['agents']
 
 export function apply(ctx, config) {
   const whitelistPath = resolveWhitelistPath(config?.whitelistPath)
@@ -118,7 +121,9 @@ export function apply(ctx, config) {
   function isSubagent(agent) {
     if (!skipSubagents) return false
     try {
-      const names = ctx.subagents?.namesOf?.(agent)
+      // subagents 不在 inject 里，用 ctx.get() 取：装配没有它时返回 undefined 而不是抛错
+      const subagents = ctx.get?.('subagents')
+      const names = subagents?.namesOf?.(agent)
       return names !== undefined && names.self !== 'lead'
     } catch {
       return false

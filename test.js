@@ -36,10 +36,11 @@ function writeWhitelist(value) {
  */
 function harness({ namesOf, config } = {}) {
   const handlers = []
+  const services = namesOf === undefined ? {} : { subagents: { namesOf } }
   const ctx = {
     on: (event, fn) => { handlers.push({ event, fn }) },
     logger: { debug: () => {} },
-    subagents: namesOf === undefined ? undefined : { namesOf },
+    get: (name) => services[name],
   }
   apply(ctx, { whitelistPath: whitelist, ...config })
   return {
