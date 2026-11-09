@@ -1,18 +1,23 @@
 /**
- * 每次对话轮次结束后，自动把下一次用的模型切到白名单里的下一个可用项。
+ * 每次对话轮次结束后，自动把下一次用的模型切到白名单里的下一个**确认可用**的模型。
  *
  * 动机：经费紧张时主要靠各渠道的免费 DeepSeek 额度。老盯着一个模型薅，
  * 单渠道额度很快耗尽。让多个已确认可用的模型轮流承接对话，整体可用时间更长。
  *
- * 原理：监听 `agent/turn-stopping`（一轮模型回复完成、turn 即将关闭时），
- * 读巡检白名单，找到当前模型的下一个，通过 `agent.model.select()` 记录。
- * 下一条用户消息就用新模型，无需手动切换。
+ * 为什么不能只看白名单：白名单是巡检脚本上一次跑出来的快照（最长可能几小时前），
+ * 期间渠道可能已经挂掉。切过去才发现不可用，这一轮任务就断了。
+ * 所以切换前做一次**真实 1-token 调用**探测，探测不过就顺延到下一个候选。
  *
- * - 白名单不可用（缺失/过期/解析失败）→ 保持当前模型，绝不打断对话
- * - 付费/官方渠道（deepseek-official / deepseek-account / codearts）不参与轮换，
- *   轮换只在免费渠道之间进行；付费模型仍可手动选择
- * - 当前模型不在轮换池里（比如手动选了付费模型）→ 从轮换池第一个开始
- * - 任何异常都静默吞掉：这是锦上添花的插件，不该影响正常使用
+ * 原理：监听 `agent/turn-stopping`（一轮模型回复完成、turn 即将关闭时），
+ * 读巡检白名单 → 过滤掉付费渠道 → 从当前模型的下一个开始，按顺序找第一个
+ * 探测通过的模型 → 通过 `agent.model.select()` 记录。下一条用户消息用它。
+ *
+ * 失败安全（任何一步出错都只是「不轮换」，绝不影响对话本身）：
+ * - 白名单不可用（缺失/过期/解析失败）→ 保持当前模型
+ * - 候选全部探测失败 → 保持当前模型（宁可花钱也不断任务）
+ * - 轮换池排完只剩 0 或 1 个 → 不轮换
+ * - llm 服务取不到 → 退回「只信白名单」的旧行为
+ * - 任何异常静默吞掉
  */
 import fs from 'node:fs'
 import os from 'node:os'
@@ -27,6 +32,21 @@ const DEFAULT_STALE_MINUTES = 180
 const DEFAULT_EXCLUDE_PROVIDERS = ['deepseek-official', 'deepseek-account', 'codearts']
 
 /**
+ * 视为「渠道级故障」的错误码。只有这些才把模型标记为不可用，
+ * 避免把工具报错、用户取消之类误判成渠道问题而错杀健康模型。
+ */
+const CHANNEL_FAILURE_CODES = new Set([
+  'QUOTA_EXCEEDED',
+  'RATE_LIMITED',
+  'TRANSPORT',
+  'AUTH',
+  'UNAUTHORIZED',
+  'UNAVAILABLE',
+  'UNKNOWN_MODEL',
+  'NO_ADAPTER',
+])
+
+/**
  * 解析白名单路径：显式配置 > 环境变量 > `~/.dsh/deepseek-whitelist.json`。
  * @param {string | undefined} configured
  * @returns {string}
@@ -38,6 +58,9 @@ function resolveWhitelistPath(configured) {
   return path.join(os.homedir(), '.dsh', 'deepseek-whitelist.json')
 }
 
+/** 渠道+模型的唯一键。 */
+const keyOf = entry => `${entry.provider}/${entry.model}`
+
 /** 在列表里找 current 的下标；找不到返回 -1。 */
 function indexOf(list, current) {
   for (let i = 0; i < list.length; i++) {
@@ -45,6 +68,11 @@ function indexOf(list, current) {
     if (entry.provider === current.provider && entry.model === current.model) return i
   }
   return -1
+}
+
+/** 取正整数配置，非法时用默认值。 */
+function positive(value, fallback) {
+  return Number.isFinite(value) && value > 0 ? Number(value) : fallback
 }
 
 export const name = 'deepseek-model-round-robin'
@@ -57,11 +85,20 @@ export function apply(ctx, config) {
   const whitelistPath = resolveWhitelistPath(config?.whitelistPath)
   const skipSubagents = config?.includeSubagents !== true
   const statePrefix = typeof config?.statePrefix === 'string' ? config.statePrefix : 'round-robin'
+
   // 配置显式给出时优先（空数组 = 不排除任何渠道，允许付费模型参与轮换）
   const excludeProviders = Array.isArray(config?.excludeProviders)
     && config.excludeProviders.every(id => typeof id === 'string')
     ? config.excludeProviders
     : null
+
+  const verify = config?.verifyBeforeSwitch !== false
+  const verifyTimeoutMs = positive(config?.verifyTimeoutMs, 8_000)
+  const verifyTtlMs = positive(config?.verifyTtlMs, 15 * 60_000)
+  const verifyCandidates = Math.max(1, Math.floor(positive(config?.verifyCandidates, 3)))
+
+  /** 健康度缓存：`provider/model` → { ok, at }。探测结果按 TTL 复用，避免每轮都打网络。 */
+  const health = new Map()
 
   let cachedMtime = -1
   let cachedModels = null
@@ -130,7 +167,89 @@ export function apply(ctx, config) {
     }
   }
 
-  ctx.on('agent/turn-stopping', ({ agent, signal }) => {
+  /** 缓存里新鲜的结论；没有则 undefined。 */
+  function cachedHealth(entry) {
+    const hit = health.get(keyOf(entry))
+    if (hit === undefined) return undefined
+    return Date.now() - hit.at < verifyTtlMs ? hit.ok : undefined
+  }
+
+  /**
+   * 对候选发一次真实 1-token 调用，确认它真的能用。
+   * 只认流里的 `finish` 帧：reason 为 error/aborted 即失败；正常结束即成功。
+   * 失败原因（错误码/异常信息）记进缓存，轮换卡住时能从日志看出为什么。
+   * @returns {Promise<boolean>}
+   */
+  async function probe(entry) {
+    const llm = ctx.get?.('llm')
+    if (llm === undefined || typeof llm.stream !== 'function') return true // 拿不到 llm 就不拦，退回旧行为
+
+    let ok = false
+    let detail = ''
+    try {
+      const stream = llm.stream({
+        provider: entry.provider,
+        model: entry.model,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
+        maxTokens: 1,
+        signal: AbortSignal.timeout(verifyTimeoutMs),
+      })
+      ok = true // 默认成功；只有明确的失败帧或抛错才翻成 false
+      for await (const chunk of stream) {
+        if (chunk?.type !== 'finish') continue
+        const kind = chunk.reason?.kind
+        if (kind === 'error' || kind === 'aborted') {
+          ok = false
+          detail = chunk.reason?.failure?.code ?? kind
+        }
+        break
+      }
+    } catch (error) {
+      ok = false
+      const code = error?.failure?.code ?? error?.code
+      detail = typeof code === 'string' ? code : (error instanceof Error ? error.message : String(error))
+    }
+    health.set(keyOf(entry), { ok, at: Date.now(), detail })
+    return ok
+  }
+
+  /**
+   * 从 current 之后按轮换顺序挑一个**确认可用**的候选。
+   * @returns {Promise<{ provider: string, model: string } | undefined>} undefined = 没有可用候选，保持当前模型
+   */
+  async function pickNext(list, current) {
+    const pos = indexOf(list, current)
+    /** 轮换顺序：从当前的下一个开始，绕一圈。current 不在池里时从第一个开始。 */
+    const ordered = []
+    for (let i = 1; i <= list.length; i++) ordered.push(list[((pos < 0 ? -1 : pos) + i) % list.length])
+
+    if (!verify) return ordered[0]
+
+    // 第一轮：只看缓存。命中的健康项直接选；已知不健康的跳过（不重复打网络）。
+    const needProbe = []
+    for (const entry of ordered) {
+      const known = cachedHealth(entry)
+      if (known === true) return entry
+      if (known === false) continue
+      needProbe.push(entry)
+      if (needProbe.length >= verifyCandidates) break
+    }
+
+    // 第二轮：把未知的候选并行探测（总耗时封顶一个超时），按顺序取第一个通过的
+    if (needProbe.length > 0) {
+      const results = await Promise.all(needProbe.map(entry => probe(entry)))
+      const hit = results.findIndex(Boolean)
+      if (hit >= 0) return needProbe[hit]
+      // 全挂：把原因带到日志里，否则「轮换不动」时无从下手
+      const why = needProbe
+        .map(entry => `${keyOf(entry)}(${health.get(keyOf(entry))?.detail || '未知'})`)
+        .join('、')
+      ctx.logger?.warn?.(`${statePrefix}: 候选全部探测失败：${why}`)
+    }
+    return undefined
+  }
+
+  ctx.on('agent/turn-stopping', async ({ agent, signal }) => {
     try {
       if (signal.aborted) return
       if (isSubagent(agent)) return
@@ -141,14 +260,32 @@ export function apply(ctx, config) {
       const current = agent.model?.current?.()
       if (current === undefined || typeof current.provider !== 'string' || typeof current.model !== 'string') return
 
-      const pos = indexOf(list, current)
-      const next = list[pos < 0 ? 0 : (pos + 1) % list.length]
+      const next = await pickNext(list, current)
+      if (next === undefined) {
+        ctx.logger?.warn?.(`${statePrefix}: 候选均未通过可用性检查，保持 ${keyOf(current)}`)
+        return
+      }
       if (next.provider === current.provider && next.model === current.model) return
 
       agent.model.select(next)
-      ctx.logger?.debug?.(`${statePrefix}: ${current.provider}/${current.model} -> ${next.provider}/${next.model}`)
+      ctx.logger?.debug?.(`${statePrefix}: ${keyOf(current)} -> ${keyOf(next)}`)
     } catch {
       // 失败安全：轮换是锦上添花，任何异常都不该影响对话
+    }
+  })
+
+  // 真实调用失败（且是渠道级故障）时立刻记账，下一轮就不会再选它。
+  // 探测和实际调用之间存在时间差，这一步补上那段窗口。
+  ctx.on('agent/error', ({ agent, error }) => {
+    try {
+      const code = error?.failure?.code ?? error?.code
+      if (typeof code !== 'string' || !CHANNEL_FAILURE_CODES.has(code)) return
+      const current = agent.model?.current?.()
+      if (current === undefined || typeof current.provider !== 'string' || typeof current.model !== 'string') return
+      health.set(keyOf(current), { ok: false, at: Date.now() })
+      ctx.logger?.warn?.(`${statePrefix}: ${keyOf(current)} 调用失败（${code}），暂时移出轮换`)
+    } catch {
+      // 失败安全
     }
   })
 }

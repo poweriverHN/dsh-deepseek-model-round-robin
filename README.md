@@ -8,13 +8,42 @@
 
 | 场景 | 结果 |
 | --- | --- |
-| 当前模型在免费池里 | 切到池里的下一个（末尾回到开头） |
-| 当前模型是付费/官方模型 | 切到池里第一个，**绝不从付费模型继续往下轮** |
+| 当前模型在免费池里 | 探到下一个**探测通过**的模型后切过去 |
+| 下一个候选探测失败 | 顺延到再下一个，最多并行探 `verifyCandidates` 个 |
+| 候选全部探测失败 | **保持当前模型不切换**（宁可不动，也不切断任务） |
+| 当前模型是付费/官方模型 | 切到免费池里的可用候选，**绝不从付费模型继续往下轮** |
 | 付费/官方渠道 | 默认不参与轮换，仍可手动选 |
 | 轮换池排完只剩 0 或 1 个 | 不轮换 |
 | 白名单缺失 / 过期 / 解析失败 | 保持当前模型不变 |
 | 子代理（subagent） | 默认跳过，不轮换 |
 | 任何异常 | 静默吞掉，绝不影响对话 |
+
+## 切换前的可用性检查
+
+白名单是巡检脚本上一次跑出来的**快照**（最长可能几小时前），期间渠道可能已经挂掉。
+切过去才发现不可用，这一轮任务就断了。所以切换前会做一次**真实调用探测**：
+
+1. 从当前模型的下一个开始，按轮换顺序取候选
+2. 探测结果**缓存 15 分钟**：缓存里标记健康的直接用，标记不健康的直接跳过（不重复打网络）
+3. 遇到未知状态的候选，**并行**探测最多 `verifyCandidates`（默认 3）个，总耗时封顶一个超时
+4. 取顺序上第一个探测通过的切过去
+5. 一个都没通过 → 保持当前模型不动
+
+探测就是一次 `max_tokens: 1` 的真实请求，成功与否只看流的 `finish` 帧。
+
+**代价**：每轮回复结束时可能多等 1～3 秒（健康渠道的探测很快）；成本约每 15 分钟 3 次 1-token 调用。
+缓存命中时不打任何网络。不想要这个开销就设 `verifyBeforeSwitch: false`，退回「只信白名单」。
+
+**失败反馈**：如果探测通过、但真正调用时失败（两者之间的时间差），
+`agent/error` 会按错误码把该模型记账为不可用，下一轮不再选它。
+只有渠道级错误码（`QUOTA_EXCEEDED`、`TRANSPORT`、`AUTH`、`UNAVAILABLE`、`UNKNOWN_MODEL` 等）
+才会触发，工具报错之类的不会错杀健康模型。
+
+故障时日志（`warn` 级）会带上每个候选的失败原因，例如：
+
+```
+round-robin: 候选全部探测失败：raccoon/sn-deepseek-v4-1-flash(QUOTA_EXCEEDED)、trae/DeepSeek-V4-Pro(TRANSPORT)
+```
 
 轮换发生在 `agent/turn-stopping`（一轮回复完成、turn 即将关闭时）。写入的是 `agent.model.select()`，**下一条用户消息**才生效，当前这轮不会被打断。
 
@@ -83,8 +112,12 @@ config:
 | --- | --- | --- |
 | `whitelistPath` | 见下 | 白名单路径 |
 | `excludeProviders` | 见下 | 不参与轮换的渠道；省略时读白名单 `rotateExclude`，再缺省用三个付费渠道 |
+| `verifyBeforeSwitch` | `true` | 切换前是否做真实调用探测 |
+| `verifyTimeoutMs` | `8000` | 单次探测超时 |
+| `verifyTtlMs` | `900000` | 探测结果缓存时长（15 分钟） |
+| `verifyCandidates` | `3` | 每轮并行探测的候选上限 |
 | `includeSubagents` | `false` | 设为 `true` 让子代理也参与轮换 |
-| `statePrefix` | `round-robin` | debug 日志前缀 |
+| `statePrefix` | `round-robin` | 日志前缀 |
 
 `whitelistPath` 解析顺序：插件配置 > 环境变量 `DSH_DEEPSEEK_WHITELIST` > `~/.dsh/deepseek-whitelist.json`。
 
@@ -95,6 +128,8 @@ config:
       config:
         whitelistPath: /home/me/patrol/whitelist.json
         excludeProviders: ['deepseek-official', 'deepseek-account', 'codearts']
+        verifyBeforeSwitch: true
+        verifyCandidates: 3
         includeSubagents: false
 ```
 
