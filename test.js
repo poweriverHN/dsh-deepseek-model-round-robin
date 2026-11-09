@@ -75,13 +75,35 @@ function harness({ namesOf, config, llm } = {}) {
         if (event === 'agent/turn-stopping') await fn({ agent, signal: { aborted: false } })
       }
     },
-    async fail(agent, error) {
+    async fail(agent, error, turn = 1) {
       for (const { event, fn } of handlers) {
-        if (event === 'agent/error') await fn({ agent, turn: 1, step: 1, error })
+        if (event === 'agent/error') await fn({ agent, turn, step: 1, error })
+      }
+    },
+    claim(agent, message, turn = 1) {
+      for (const { event, fn } of handlers) {
+        if (event === 'agent/inbox/claimed') fn({ agent, message, turn })
       }
     },
   }
 }
+
+/**
+ * 造一个能接收回填的假 agent。
+ * @param {{ events?: object[] }} [options] session.ownEvents() 的返回值
+ */
+function recoverableAgent(options = {}) {
+  const appended = []
+  return {
+    appended,
+    session: { ownEvents: () => options.events ?? [] },
+    inbox: { append: (target, message) => { appended.push({ target, message }) } },
+    model: { current: () => FREE[0], select: () => {} },
+  }
+}
+
+const INPUT = [{ type: 'text', text: '帮我改一下这个函数' }]
+const userMessage = (id = 'm1') => ({ id, role: 'user', source: { kind: 'user' }, content: INPUT })
 
 /** 记录 select 调用的假 agent。 */
 function agentAt(selection, sink) {
@@ -270,4 +292,106 @@ test('select 抛错被吞掉，不炸掉对话', async () => {
     },
   }
   await harness({ llm: fakeLlm(() => 'ok') }).fire(agent)
+})
+
+// ---------- 失败后保住用户输入 ----------
+
+test('消息没进日志且是渠道故障时，放回队列', async () => {
+  const h = harness()
+  const agent = recoverableAgent()
+  h.claim(agent, userMessage())
+  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  assert.strictEqual(agent.appended.length, 1)
+  assert.strictEqual(agent.appended[0].target, 'next-turn')
+  assert.deepStrictEqual(agent.appended[0].message.content, INPUT)
+  assert.notStrictEqual(agent.appended[0].message.id, 'm1', '重新入队要用新的消息 id')
+})
+
+test('消息已经写进日志时不重复入队', async () => {
+  const h = harness()
+  const agent = recoverableAgent({ events: [{ type: 'user/message', data: { id: 'm1' } }] })
+  h.claim(agent, userMessage())
+  await h.fail(agent, { code: 'TRANSPORT' })
+  assert.strictEqual(agent.appended.length, 0)
+})
+
+test('非渠道级错误不动用户输入', async () => {
+  const h = harness()
+  const agent = recoverableAgent()
+  h.claim(agent, userMessage())
+  await h.fail(agent, { code: 'TOOL_FAILED' })
+  assert.strictEqual(agent.appended.length, 0)
+})
+
+test('错误属于别的轮次时不入队', async () => {
+  const h = harness()
+  const agent = recoverableAgent()
+  h.claim(agent, userMessage(), 1)
+  await h.fail(agent, { code: 'QUOTA_EXCEEDED' }, 2)
+  assert.strictEqual(agent.appended.length, 0)
+})
+
+test('没有 claimed 记录时不入队', async () => {
+  const h = harness()
+  const agent = recoverableAgent()
+  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  assert.strictEqual(agent.appended.length, 0)
+})
+
+test('空内容不入队', async () => {
+  const h = harness()
+  const agent = recoverableAgent()
+  h.claim(agent, { id: 'm1', role: 'user', source: { kind: 'user' }, content: [] })
+  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  assert.strictEqual(agent.appended.length, 0)
+})
+
+test('同一段输入反复失败时按上限停止入队', async () => {
+  const h = harness({ config: { maxRequeuePerMessage: 2 } })
+  const agent = recoverableAgent()
+  for (let i = 0; i < 5; i++) {
+    h.claim(agent, userMessage(`m${i}`))
+    await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  }
+  assert.strictEqual(agent.appended.length, 2)
+})
+
+test('recoverFailedInput 关掉后不再回填', async () => {
+  const h = harness({ config: { recoverFailedInput: false } })
+  const agent = recoverableAgent()
+  h.claim(agent, userMessage())
+  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  assert.strictEqual(agent.appended.length, 0)
+})
+
+test('子代理失败不回填（那是父代理给的输入）', async () => {
+  const h = harness({ namesOf: () => ({ self: 'subagent-1' }) })
+  const agent = recoverableAgent()
+  h.claim(agent, userMessage())
+  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  assert.strictEqual(agent.appended.length, 0)
+})
+
+test('日志读不了时保守不入队', async () => {
+  const h = harness()
+  let appended = 0
+  const agent = {
+    session: { ownEvents: () => { throw new Error('unreadable') } },
+    inbox: { append: () => { appended++ } },
+    model: { current: () => FREE[0], select: () => {} },
+  }
+  h.claim(agent, userMessage())
+  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  assert.strictEqual(appended, 0, '宁可不出重复消息')
+})
+
+test('inbox.append 抛错也不炸掉对话', async () => {
+  const h = harness()
+  const agent = {
+    session: { ownEvents: () => [] },
+    inbox: { append: () => { throw new Error('boom') } },
+    model: { current: () => FREE[0], select: () => {} },
+  }
+  h.claim(agent, userMessage())
+  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
 })

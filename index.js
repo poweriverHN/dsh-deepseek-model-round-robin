@@ -19,6 +19,7 @@
  * - llm 服务取不到 → 退回「只信白名单」的旧行为
  * - 任何异常静默吞掉
  */
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -34,6 +35,8 @@ const DEFAULT_EXCLUDE_PROVIDERS = ['deepseek-official', 'deepseek-account', 'cod
 /**
  * 视为「渠道级故障」的错误码。只有这些才把模型标记为不可用，
  * 避免把工具报错、用户取消之类误判成渠道问题而错杀健康模型。
+ * 也正因为它们是「可能在用户消息落盘之前就失败」的那一类，
+ * 同一个集合被用来判断要不要把本轮输入放回队列。
  */
 const CHANNEL_FAILURE_CODES = new Set([
   'QUOTA_EXCEEDED',
@@ -44,6 +47,7 @@ const CHANNEL_FAILURE_CODES = new Set([
   'UNAVAILABLE',
   'UNKNOWN_MODEL',
   'NO_ADAPTER',
+  'NO_CREDENTIAL',
 ])
 
 /**
@@ -75,6 +79,29 @@ function positive(value, fallback) {
   return Number.isFinite(value) && value > 0 ? Number(value) : fallback
 }
 
+/** 把消息内容拼成纯文本，用来做去重键。 */
+function textOf(content) {
+  if (!Array.isArray(content)) return ''
+  return content
+    .map(block => (block !== null && typeof block === 'object' && typeof block.text === 'string' ? block.text : ''))
+    .join('')
+    .trim()
+}
+
+/** 这条消息是否已经出现在会话日志里（= 内容没丢，只是模型失败）。 */
+function recorded(session, messageId) {
+  try {
+    for (const event of session.ownEvents()) {
+      if (event.type !== 'user/message') continue
+      if (event.data?.id === messageId) return true
+    }
+  } catch {
+    // 读不到日志时保守认为已经记录，避免重复入队
+    return true
+  }
+  return false
+}
+
 export const name = 'deepseek-model-round-robin'
 // 只硬依赖 agents。subagents 是可选能力：装配里没有它时用 ctx.get() 拿不到，
 // 就当作没有子代理概念、一律轮换。写成 cordis 的 {required, optional} 是不行的——
@@ -97,8 +124,17 @@ export function apply(ctx, config) {
   const verifyTtlMs = positive(config?.verifyTtlMs, 15 * 60_000)
   const verifyCandidates = Math.max(1, Math.floor(positive(config?.verifyCandidates, 3)))
 
+  // 失败后是否把本轮输入放回队列（默认开）
+  const recoverInput = config?.recoverFailedInput !== false
+  const maxRequeue = Math.floor(positive(config?.maxRequeuePerMessage, 2))
+
   /** 健康度缓存：`provider/model` → { ok, at }。探测结果按 TTL 复用，避免每轮都打网络。 */
   const health = new Map()
+
+  /** 每个 agent 最近一次被取走的用户消息，用于失败后回填。 */
+  const claimed = new WeakMap()
+  /** 每个 agent 的「原文 → 已重新入队次数」，防止死循环。 */
+  const requeued = new WeakMap()
 
   let cachedMtime = -1
   let cachedModels = null
@@ -274,18 +310,64 @@ export function apply(ctx, config) {
     }
   })
 
-  // 真实调用失败（且是渠道级故障）时立刻记账，下一轮就不会再选它。
-  // 探测和实际调用之间存在时间差，这一步补上那段窗口。
-  ctx.on('agent/error', ({ agent, error }) => {
+  // 记住每轮被取走的用户消息，失败时可能要把它放回队列
+  ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
+    try {
+      claimed.set(agent, { message, turn })
+    } catch {
+      // 失败安全
+    }
+  })
+
+  // 真实调用失败（且是渠道级故障）时做两件事：
+  //   1. 把这个模型记账为不可用，下一轮不再选它（补上探测与实际调用之间的时间差）
+  //   2. 如果用户这条消息根本没写进日志，就把原文放回队列，别把输入吃掉
+  ctx.on('agent/error', ({ agent, turn, error }) => {
     try {
       const code = error?.failure?.code ?? error?.code
       if (typeof code !== 'string' || !CHANNEL_FAILURE_CODES.has(code)) return
+
       const current = agent.model?.current?.()
-      if (current === undefined || typeof current.provider !== 'string' || typeof current.model !== 'string') return
-      health.set(keyOf(current), { ok: false, at: Date.now() })
-      ctx.logger?.warn?.(`${statePrefix}: ${keyOf(current)} 调用失败（${code}），暂时移出轮换`)
+      if (current !== undefined && typeof current.provider === 'string' && typeof current.model === 'string') {
+        health.set(keyOf(current), { ok: false, at: Date.now() })
+        ctx.logger?.warn?.(`${statePrefix}: ${keyOf(current)} 调用失败（${code}），暂时移出轮换`)
+      }
+
+      // 子代理的输入是父代理给的，不该被当成用户输入回填
+      if (!recoverInput || isSubagent(agent)) return
+
+      const pending = claimed.get(agent)
+      if (pending === undefined || pending.turn !== turn) return
+
+      // 已经写进日志 → 内容没丢，交给对话列表显示即可，不重复入队
+      if (recorded(agent.session, pending.message.id)) return
+
+      const text = textOf(pending.message.content)
+      if (text === '') return
+
+      // 防循环：同一段原文反复失败时不再无限入队
+      let counts = requeued.get(agent)
+      if (counts === undefined) {
+        counts = new Map()
+        requeued.set(agent, counts)
+      }
+      const count = counts.get(text) ?? 0
+      if (count >= maxRequeue) {
+        ctx.logger?.warn?.(`${statePrefix}: 同一段输入已重新入队 ${count} 次，本次不再入队，避免死循环`)
+        return
+      }
+      counts.set(text, count + 1)
+
+      // 队列不唤醒驱动：放回去只是为了让用户能换模型后自己重发
+      agent.inbox.append('next-turn', {
+        id: randomUUID(),
+        role: 'user',
+        source: { kind: 'user' },
+        content: pending.message.content,
+      })
+      ctx.logger?.info?.(`${statePrefix}: 模型调用失败（${code}），已把该轮输入放回队列，可换模型后重发`)
     } catch {
-      // 失败安全
+      // 失败安全：这只是兜底，不该影响对话
     }
   })
 }
