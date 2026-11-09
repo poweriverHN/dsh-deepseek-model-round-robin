@@ -27,10 +27,14 @@ import path from 'node:path'
 const DEFAULT_STALE_MINUTES = 180
 
 /**
- * 付费/官方渠道：默认不参与轮换。
- * 轮换只在免费渠道之间进行，付费模型仍可手动选择，只是不会被自动切过去。
+ * DeepSeek 官方渠道：默认不参与轮换。
+ *
+ * 用户 2026-11-09 要求只有 DeepSeek 官方排除在外：「不要管收费还是免费，只要
+ * 巡检能正常调用都列出来，除了 deepseek 官方的不巡检、不进入轮换名单」。
+ * 所以 codearts 已从本表移除——它是普通渠道，照常参与轮换。
+ * 被排除的渠道仍可手动选择，只是不会被自动切过去。
  */
-const DEFAULT_EXCLUDE_PROVIDERS = ['deepseek-official', 'deepseek-account', 'codearts']
+const DEFAULT_EXCLUDE_PROVIDERS = ['deepseek-official', 'deepseek-account']
 
 /**
  * 视为「渠道级故障」的错误码。只有这些才把模型标记为不可用，

@@ -11,7 +11,14 @@ import test from 'node:test'
 
 import { apply } from './index.js'
 
-/** 一份混了付费渠道的白名单：codearts 付费，trae / loomy 免费。 */
+/**
+ * 一份混合白名单：codearts、trae、loomy 三个渠道。
+ *
+ * `FREE` 是「按内置默认排除规则后仍在轮换池里」的那部分。2026-11-09 用户要求
+ * 只排除 DeepSeek 官方，codearts 因此回到池里——但本文件多处用例依赖 `FREE`
+ * 表示「池中的后两个」，为保持这些用例语义不变，下面的用例显式用 `rotateExclude`
+ * 把 codearts 排掉，再验证「只在池内轮换」。
+ */
 const LIST = [
   { provider: 'codearts', model: 'deepseek-v4.1-flash' },
   { provider: 'trae', model: 'DeepSeek-V4-Pro' },
@@ -128,7 +135,9 @@ test('探测通过才切换：下一个可用时切到它', async () => {
 })
 
 test('下一个不可用时顺延到再下一个', async () => {
-  writeWhitelist({ at: Date.now(), models: LIST })
+  // 排掉 codearts，让池回到 [trae, loomy]，才能验证「loomy 的下一个（trae）坏、
+  // 再下一个」这一绕回语义。
+  writeWhitelist({ at: Date.now(), rotateExclude: ['codearts'], models: LIST })
   const sink = {}
   const log = { calls: [] }
   // 当前是 loomy（末尾），下一个绕回 trae；让 loomy 挂、trae 好
@@ -193,16 +202,19 @@ test('拿不到 llm 服务时不拦，退回旧行为', async () => {
   assert.deepStrictEqual(sink.picked, FREE[1])
 })
 
-test('付费渠道默认不参与轮换', async () => {
-  writeWhitelist({ at: Date.now(), models: LIST })
+test('DeepSeek 官方渠道默认不参与轮换', async () => {
+  // 官方渠道在池外：从 codearts 出发，下一个应是 trae（如果 codearts 被排除则是
+  // trae；这里显式排官方，验证官方不会被选中/探测）。
+  const OFFICIAL = [{ provider: 'deepseek-official', model: 'deepseek-chat' }, LIST[0], LIST[1]]
+  writeWhitelist({ at: Date.now(), models: OFFICIAL })
   const sink = {}
   const log = { calls: [] }
-  await harness({ llm: fakeLlm(() => 'ok', log) }).fire(agentAt(LIST[0], sink))
-  assert.deepStrictEqual(sink.picked, FREE[0], '只在免费渠道之间轮换')
-  assert.ok(!log.calls.some(c => c.startsWith('codearts/')), '绝不探测付费渠道')
+  await harness({ llm: fakeLlm(() => 'ok', log) }).fire(agentAt(LIST[1], sink))
+  assert.deepStrictEqual(sink.picked, LIST[0], '下一个是池内的 codearts，不是官方渠道')
+  assert.ok(!log.calls.some(c => c.startsWith('deepseek-official/')), '绝不探测官方渠道')
 })
 
-test('excludeProviders 为空时付费渠道参与轮换', async () => {
+test('excludeProviders 为空时所有渠道都参与轮换', async () => {
   writeWhitelist({ at: Date.now(), models: LIST })
   const sink = {}
   await harness({ llm: fakeLlm(() => 'ok'), config: { excludeProviders: [] } })
@@ -211,18 +223,18 @@ test('excludeProviders 为空时付费渠道参与轮换', async () => {
 })
 
 test('白名单的 rotateExclude 覆盖内置默认', async () => {
-  // 只排 trae：codearts 是付费的，但既然没写进 rotateExclude，它就回到池里
+  // 只排 trae：codearts 是普通渠道、没写进 rotateExclude，因此留在池里
   writeWhitelist({ at: Date.now(), rotateExclude: ['trae'], models: LIST })
   const sink = {}
   await harness({ llm: fakeLlm(() => 'ok') }).fire(agentAt(LIST[0], sink))
   assert.deepStrictEqual(sink.picked, LIST[2], '池里是 codearts + loomy，codearts 的下一个是 loomy')
 })
 
-test('排掉付费渠道后只剩一个模型时不轮换', async () => {
-  writeWhitelist({ at: Date.now(), models: [LIST[0], LIST[1]] })
+test('显式排掉 codearts 后只剩一个模型时不轮换', async () => {
+  writeWhitelist({ at: Date.now(), rotateExclude: ['codearts'], models: [LIST[0], LIST[1]] })
   const sink = {}
   await harness({ llm: fakeLlm(() => 'ok') }).fire(agentAt(LIST[1], sink))
-  assert.strictEqual(sink.picked, undefined)
+  assert.strictEqual(sink.picked, undefined, '池里只有 trae 自己，不切')
 })
 
 test('白名单过期时不轮换', async () => {
