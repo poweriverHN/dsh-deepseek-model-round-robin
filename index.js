@@ -37,21 +37,59 @@ const DEFAULT_STALE_MINUTES = 180
 const DEFAULT_EXCLUDE_PROVIDERS = ['deepseek-official', 'deepseek-account']
 
 /**
- * 视为「渠道级故障」的错误码。只有这些才把模型标记为不可用，
+ * 「这个渠道/模型现在服务不了请求」的失败码，抄自 DSH 的 `LLM_FAILURE_CODES`
+ * （`@deepseek-ai/dsh-llm/error`）。只有这些才把模型标记为不可用，
  * 避免把工具报错、用户取消之类误判成渠道问题而错杀健康模型。
- * 也正因为它们是「可能在用户消息落盘之前就失败」的那一类，
- * 同一个集合被用来判断要不要把本轮输入放回队列。
+ *
+ * 注意：这张表早先有一半是**凭印象编的**。`QUOTA_EXCEEDED`、`RATE_LIMITED`、
+ * `UNAUTHORIZED`、`UNAVAILABLE`、`NO_CREDENTIAL` 在 DSH 里**根本不存在**，
+ * 命中不了任何真实错误。真实码是 `QUOTA`、`RATE_LIMIT`、`ACCOUNT_TOKEN_INVALID`、
+ * `SERVER`、`MISSING_CREDENTIAL` 等。要加码请照着上面那个模块抄，不要猜。
  */
-const CHANNEL_FAILURE_CODES = new Set([
-  'QUOTA_EXCEEDED',
-  'RATE_LIMITED',
-  'TRANSPORT',
+const FAILURE_CODES = new Set([
+  // 额度与限流
+  'ACCOUNT_QUOTA',
+  'QUOTA',
+  'RATE_LIMIT',
+  // 凭据
   'AUTH',
-  'UNAUTHORIZED',
-  'UNAVAILABLE',
+  'ACCOUNT_SIGN_IN_REQUIRED',
+  'ACCOUNT_TOKEN_INVALID',
+  'MISSING_CREDENTIAL',
+  'NO_CREDENTIAL_STORE',
+  'INVALID_CREDENTIAL',
+  // 传输与服务端
+  'TRANSPORT',
+  'SERVER',
+  'TIMEOUT',
+  'STREAM_CLOSED',
+  'EMPTY_RESPONSE',
+  'MALFORMED_RESPONSE',
+  // 适配器与模型
   'UNKNOWN_MODEL',
   'NO_ADAPTER',
-  'NO_CREDENTIAL',
+  'INVALID_ADAPTER',
+  'MODEL_UNSUPPORTED',
+  'DUPLICATE_ADAPTER',
+  // 发现
+  'DISCOVERY_FAILED',
+  'DISCOVERY_UNSUPPORTED',
+  'NO_DISCOVERY',
+  'INVALID_DISCOVERY',
+])
+
+/**
+ * 「目标模型撑不住当前上下文」的失败码：不是渠道挂了，而是这个模型当不了切换目标。
+ *
+ * 最常见的原因是适配器没给该模型声明 `contextWindow`。DSH 的模型切换压缩要求目标
+ * 具备已声明的上下文容量，**哪怕历史很短也一样**，所以这类模型永远不能作为切换目标。
+ *
+ * 处理方式和渠道故障不同：继续往前轮换只会再撞一次，应当**退回上一个真正提交过
+ * 请求的模型**（DSH 在压缩失败时会保留原请求头，这正是权威依据）。
+ */
+const CAPACITY_CODES = new Set([
+  'MODEL_SWITCH_COMPACTION_FAILED',
+  'INVALID_MODEL_CONTEXT',
 ])
 
 /**
@@ -225,14 +263,49 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 这个模型能不能当**切换目标**。
+   *
+   * DSH 的模型切换压缩要求目标具备已声明的上下文容量
+   * （`llm.resolveModelInfo(...).context`），**历史再短也一样**；没声明的模型一旦被
+   * 切过去，整轮就以 `MODEL_SWITCH_COMPACTION_FAILED` 结束，用户那条消息白打。
+   * 所以轮换前先问一次，把这类模型直接排除，而不是等它把这一轮打掉再补救。
+   *
+   * 问不到时一律返回 true（没有 llm、方法不存在、调用抛错）：查不出来就不该拦，
+   * 交给后面的可用性探测和失败兜底去处理。
+   *
+   * @returns {Promise<boolean>}
+   */
+  async function switchable(entry) {
+    const llm = ctx.get?.('llm')
+    if (llm === undefined || typeof llm.resolveModelInfo !== 'function') return true
+    try {
+      const info = await llm.resolveModelInfo(entry.provider, entry.model, AbortSignal.timeout(verifyTimeoutMs))
+      if (info === undefined || info === null) return true
+      return info.context !== undefined
+    } catch {
+      return true
+    }
+  }
+
+  /**
    * 对候选发一次真实 1-token 调用，确认它真的能用。
    * 只认流里的 `finish` 帧：reason 为 error/aborted 即失败；正常结束即成功。
    * 失败原因（错误码/异常信息）记进缓存，轮换卡住时能从日志看出为什么。
+   *
+   * 探测前先过一遍容量检查：这样凡是能在缓存里标记为「健康」的候选，
+   * 一定同时满足「装得下上下文」，不会出现探测通过、切过去却被压缩拦下的事。
+   * 容量检查也走同一份缓存，所以每 15 分钟最多问一次。
+   *
    * @returns {Promise<boolean>}
    */
   async function probe(entry) {
     const llm = ctx.get?.('llm')
     if (llm === undefined || typeof llm.stream !== 'function') return true // 拿不到 llm 就不拦，退回旧行为
+
+    if (!(await switchable(entry))) {
+      health.set(keyOf(entry), { ok: false, at: Date.now(), detail: 'no contextWindow (不能作为切换目标)' })
+      return false
+    }
 
     let ok = false
     let detail = ''
@@ -386,51 +459,95 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 渠道级故障的兜底处理，按代价从低到高依次尝试：
-   *   1. 把出故障的模型记账为不可用（补上「探测通过」与「真实调用」之间的时间差）
-   *   2. 自动换到下一个确认可用的模型，用同一轮历史重跑——用户无感
-   *   3. 重跑额度用尽或换不到模型时，把输入放回队列，让用户手工换模型重发
+   * 上一个真正提交过请求的模型。DSH 在模型切换压缩失败时会保留原请求头，
+   * 所以这是「该退回哪个模型」的权威依据，比自己记一份更可靠。
+   */
+  function lastCommittedModel(agent) {
+    try {
+      const config = agent.session?.requestHeader?.()?.config
+      if (config === undefined) return undefined
+      if (typeof config.provider !== 'string' || typeof config.model !== 'string') return undefined
+      return { provider: config.provider, model: config.model }
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * 失败后的兜底处理。两类失败分开对待：
    *
-   * 之所以能重跑：用户那条消息失败时已经在日志里了，模型下一轮请求会带上它，
-   * 所以只要能再发起一次请求，这一轮就被救回来了。
+   * - **渠道/模型故障**（`FAILURE_CODES`）：换个确认可用的模型接着跑。
+   * - **目标模型撑不住上下文**（`CAPACITY_CODES`）：继续往前轮换只会再撞一次，
+   *   退回上一个真正提交过请求的模型。
+   *
+   * 两者都是先换模型、再（有额度时）用同一轮历史自动重跑；额度用尽或换不到模型，
+   * 才把输入放回队列让用户手工重发。
+   *
+   * 关键时序：**必须等这一轮彻底跑完再碰 inbox**。`turn()` 在 catch 之后会检查
+   * `if (!this.inbox.hasPending) return false` —— 若在 `agent/error` 里同步入队，
+   * 驱动会立刻再开一轮、把刚放回去的消息吃掉，用户反而看不到它，
+   * 于是「回显到输入框」变成「消息凭空消失」。
    */
   async function handleFailure(agent, turn, error) {
     const code = error?.failure?.code ?? error?.code
-    if (typeof code !== 'string' || !CHANNEL_FAILURE_CODES.has(code)) return
+    if (typeof code !== 'string') return
+    const capacity = CAPACITY_CODES.has(code)
+    if (!capacity && !FAILURE_CODES.has(code)) return
 
     const current = agent.model?.current?.()
     const currentKnown = current !== undefined && typeof current.provider === 'string' && typeof current.model === 'string'
     if (currentKnown) {
       health.set(keyOf(current), { ok: false, at: Date.now() })
-      ctx.logger?.warn?.(`${statePrefix}: ${keyOf(current)} 调用失败（${code}），暂时移出轮换`)
+      ctx.logger?.warn?.(
+        `${statePrefix}: ${keyOf(current)} 调用失败（${code}）`
+        + `${capacity ? '，该模型装不下当前上下文' : ''}，暂时移出轮换`,
+      )
     }
 
     // 子代理的输入是父代理给的，重跑与回填都不该由这里做
     if (isSubagent(agent)) return
 
+    // 等驱动收尾再做任何入队：见上面关于 inbox 时序的说明
+    await agent.whenIdle?.()
+
     const used = retries.get(agent) ?? 0
-    if (autoRetry > 0 && used < autoRetry && currentKnown) {
+    const budgetLeft = autoRetry > 0 && used < autoRetry
+
+    let target
+    if (capacity) {
+      target = lastCommittedModel(agent)
+    } else if (currentKnown) {
       const list = readRotationList()
-      const next = list === undefined ? undefined : await pickNext(list, current)
-      if (next !== undefined && !(next.provider === current.provider && next.model === current.model)) {
-        retries.set(agent, used + 1)
-        agent.model.select(next)
-        // 等本轮真正收尾再唤醒：在 agent/error 里同步重入驱动会撞上正在结束的这一轮
-        await agent.whenIdle?.()
-        if (agent.status === 'idle') {
-          agent.followup(triggerMessage())
-          ctx.logger?.info?.(
-            `${statePrefix}: ${keyOf(current)} 故障（${code}），已自动切到 ${keyOf(next)}，用同一轮历史重试（第 ${used + 1}/${autoRetry} 次）`,
-          )
-          return
-        }
-        // 用户已经发了新消息（或 agent 又被唤醒）：让那一轮自然跑，不要插队
-        ctx.logger?.info?.(`${statePrefix}: 已切到 ${keyOf(next)}，但 agent 不空闲，交给下一次输入`)
-        return
-      }
-      ctx.logger?.warn?.(`${statePrefix}: 换不到可用模型，本轮不再自动重试`)
+      target = list === undefined ? undefined : await pickNext(list, current)
+    }
+    if (target !== undefined && currentKnown
+      && target.provider === current.provider && target.model === current.model) {
+      target = undefined
     }
 
+    // 先把选择从「用不了的那个」挪开，否则用户重发还是撞同一个错，等于卡死
+    if (target !== undefined) agent.model.select(target)
+
+    if (budgetLeft && target !== undefined) {
+      retries.set(agent, used + 1)
+      if (agent.status === 'idle') {
+        agent.followup(triggerMessage())
+        ctx.logger?.info?.(
+          `${statePrefix}: ${keyOf(current)} 故障（${code}），已换到 ${keyOf(target)}，`
+          + `用同一轮历史重试（第 ${used + 1}/${autoRetry} 次）`,
+        )
+        return
+      }
+      // 用户已经发了新消息（或 agent 又被唤醒）：让那一轮自然跑，不要插队
+      ctx.logger?.info?.(`${statePrefix}: 已换到 ${keyOf(target)}，但 agent 不空闲，交给下一次输入`)
+      return
+    }
+
+    if (target !== undefined) {
+      ctx.logger?.info?.(`${statePrefix}: 已换到 ${keyOf(target)}，等待重发`)
+    } else {
+      ctx.logger?.warn?.(`${statePrefix}: 换不到可用模型，需要手工选择`)
+    }
     queueInputBack(agent, turn, code)
   }
 

@@ -39,23 +39,33 @@ function writeWhitelist(value) {
 /**
  * 造一个假的 llm 服务。
  * @param {(provider: string, model: string) => 'ok' | 'fail' | 'throw'} outcome 每个候选的探测结果
- * @param {{ calls?: string[] }} log 记录探测过的候选
+ * @param {{ calls?: string[], infoCalls?: string[] }} log 记录探测过的候选
+ * @param {Set<string>} [noCapacity] 这些 `provider/model` 没有声明 contextWindow
+ * @param {boolean} [noResolve] 干脆不提供 resolveModelInfo（模拟老版本/拿不到服务）
  */
-function fakeLlm(outcome, log = { calls: [] }) {
-  return {
+function fakeLlm(outcome, log = { calls: [] }, noCapacity, noResolve = false) {
+  const service = {
     stream({ provider, model }) {
       log.calls.push(`${provider}/${model}`)
       const result = outcome(provider, model)
       return (async function* () {
         if (result === 'throw') throw new Error('channel down')
         if (result === 'fail') {
-          yield { type: 'finish', reason: { kind: 'error', failure: { code: 'QUOTA_EXCEEDED' } } }
+          yield { type: 'finish', reason: { kind: 'error', failure: { code: 'QUOTA' } } }
           return
         }
         yield { type: 'finish', reason: { kind: 'stop' } }
       })()
     },
   }
+  if (!noResolve) {
+    service.resolveModelInfo = async (provider, model) => {
+      log.infoCalls?.push(`${provider}/${model}`)
+      if (noCapacity?.has(`${provider}/${model}`) === true) return { inputModalities: ['text'] }
+      return { context: { contextWindow: 1_048_576 }, inputModalities: ['text'] }
+    }
+  }
+  return service
 }
 
 /**
@@ -130,19 +140,29 @@ function harness({ namesOf, config, llm } = {}) {
 /**
  * 造一个能接收回填的假 agent。
  * `whenIdle` / `status` / `followup` 齐全，这样自动重跑那条分支也能被驱动。
- * @param {{ events?: object[], idle?: boolean }} [options]
+ * @param {{ events?: object[], idle?: boolean, header?: { provider: string, model: string } }} [options]
  */
 function recoverableAgent(options = {}) {
   const appended = []
   const followups = []
+  const timeline = []
   return {
     appended,
     followups,
+    timeline,
     status: options.idle === false ? 'running' : 'idle',
-    whenIdle: async () => {},
+    whenIdle: async () => { timeline.push('whenIdle') },
     followup: message => { followups.push(message) },
-    session: { ownEvents: () => options.events ?? [] },
-    inbox: { append: (target, message) => { appended.push({ target, message }) } },
+    session: {
+      ownEvents: () => options.events ?? [],
+      requestHeader: () => (options.header === undefined ? undefined : { config: options.header }),
+    },
+    inbox: {
+      append: (target, message) => {
+        timeline.push('append')
+        appended.push({ target, message })
+      },
+    },
     model: { current: () => FREE[0], select: () => {} },
   }
 }
@@ -315,7 +335,7 @@ test('渠道级故障会把该模型记账为不可用，下轮避开', async ()
   // 先用一次调用把 trae 记进缓存（成功）
   await h.fire(agentAt(FREE[0], {}))
   // 然后 trae 真实调用失败
-  await h.fail(agentAt(FREE[1], {}), { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agentAt(FREE[1], {}), { code: 'QUOTA' })
   log.calls.length = 0
   const sink = {}
   await h.fire(agentAt(FREE[0], sink))
@@ -350,7 +370,7 @@ test('消息没进日志且是渠道故障时，放回队列', async () => {
   const h = harness({ config: { autoRetryOnFailure: 0 } })
   const agent = recoverableAgent()
   h.claim(agent, userMessage())
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agent, { code: 'QUOTA' })
   assert.strictEqual(agent.appended.length, 1)
   assert.strictEqual(agent.appended[0].target, 'next-turn')
   assert.deepStrictEqual(agent.appended[0].message.content, INPUT)
@@ -377,14 +397,14 @@ test('错误属于别的轮次时不入队', async () => {
   const h = harness({ config: { autoRetryOnFailure: 0 } })
   const agent = recoverableAgent()
   h.claim(agent, userMessage(), 1)
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' }, 2)
+  await h.fail(agent, { code: 'QUOTA' }, 2)
   assert.strictEqual(agent.appended.length, 0)
 })
 
 test('没有 claimed 记录时不入队', async () => {
   const h = harness({ config: { autoRetryOnFailure: 0 } })
   const agent = recoverableAgent()
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agent, { code: 'QUOTA' })
   assert.strictEqual(agent.appended.length, 0)
 })
 
@@ -392,7 +412,7 @@ test('空内容不入队', async () => {
   const h = harness({ config: { autoRetryOnFailure: 0 } })
   const agent = recoverableAgent()
   h.claim(agent, { id: 'm1', role: 'user', source: { kind: 'user' }, content: [] })
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agent, { code: 'QUOTA' })
   assert.strictEqual(agent.appended.length, 0)
 })
 
@@ -401,7 +421,7 @@ test('同一段输入反复失败时按上限停止入队', async () => {
   const agent = recoverableAgent()
   for (let i = 0; i < 5; i++) {
     h.claim(agent, userMessage(`m${i}`))
-    await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+    await h.fail(agent, { code: 'QUOTA' })
   }
   assert.strictEqual(agent.appended.length, 2)
 })
@@ -410,7 +430,7 @@ test('recoverFailedInput 关掉后不再回填', async () => {
   const h = harness({ config: { recoverFailedInput: false, autoRetryOnFailure: 0 } })
   const agent = recoverableAgent()
   h.claim(agent, userMessage())
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agent, { code: 'QUOTA' })
   assert.strictEqual(agent.appended.length, 0)
 })
 
@@ -418,7 +438,7 @@ test('子代理失败不回填（那是父代理给的输入）', async () => {
   const h = harness({ namesOf: () => ({ self: 'subagent-1' }), config: { autoRetryOnFailure: 0 } })
   const agent = recoverableAgent()
   h.claim(agent, userMessage())
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agent, { code: 'QUOTA' })
   assert.strictEqual(agent.appended.length, 0)
 })
 
@@ -431,7 +451,7 @@ test('日志读不了时保守不入队', async () => {
     model: { current: () => FREE[0], select: () => {} },
   }
   h.claim(agent, userMessage())
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agent, { code: 'QUOTA' })
   assert.strictEqual(appended, 0, '宁可不出重复消息')
 })
 
@@ -443,7 +463,7 @@ test('inbox.append 抛错也不炸掉对话', async () => {
     model: { current: () => FREE[0], select: () => {} },
   }
   h.claim(agent, userMessage())
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agent, { code: 'QUOTA' })
 })
 
 // ---------- 失败后自动换模型重跑 ----------
@@ -458,7 +478,7 @@ test('渠道故障时自动切到下一个可用模型，并用同一轮历史�
     followup: message => { agent.followups.push(message) },
     followups: [],
   })
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agent, { code: 'QUOTA' })
   assert.deepStrictEqual(sink.picked, FREE[1], '切到探测通过的下一个')
   assert.strictEqual(agent.followups.length, 1, '唤醒一次，让这一轮用新模型重跑')
 })
@@ -486,7 +506,7 @@ test('agent 不空闲时不插队，交给用户的下一次输入', async () =>
     followups: [],
     followup: message => { agent.followups.push(message) },
   })
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agent, { code: 'QUOTA' })
   assert.strictEqual(agent.followups.length, 0, '不抢正在跑的那一轮')
   assert.deepStrictEqual(sink.picked, FREE[1], '但模型已经换好，下一次输入就用它')
 })
@@ -500,8 +520,8 @@ test('自动重跑达到上限后停下，不再唤醒', async () => {
     followups: [],
     followup: message => { agent.followups.push(message) },
   })
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agent, { code: 'QUOTA' })
+  await h.fail(agent, { code: 'QUOTA' })
   assert.strictEqual(agent.followups.length, 1, '额度只有 1 次')
 })
 
@@ -514,9 +534,9 @@ test('一轮顺利跑完后重试额度清零', async () => {
     followups: [],
     followup: message => { agent.followups.push(message) },
   })
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agent, { code: 'QUOTA' })
   await h.fire(agent) // 一轮正常结束
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agent, { code: 'QUOTA' })
   assert.strictEqual(agent.followups.length, 2, '成功一轮后额度还回来')
 })
 
@@ -525,7 +545,7 @@ test('关掉自动重跑时才走回填', async () => {
   const h = harness({ llm: fakeLlm(() => 'ok'), config: { autoRetryOnFailure: 0 } })
   const agent = recoverableAgent()
   h.claim(agent, userMessage())
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agent, { code: 'QUOTA' })
   assert.strictEqual(agent.followups.length, 0)
   assert.strictEqual(agent.appended.length, 1, '退回队列让用户手工重发')
 })
@@ -536,7 +556,7 @@ test('换不到可用模型时回落到回填输入', async () => {
   const h = harness({ llm: fakeLlm(() => 'fail') })
   const agent = recoverableAgent()
   h.claim(agent, userMessage())
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agent, { code: 'QUOTA' })
   assert.strictEqual(agent.followups.length, 0)
   assert.strictEqual(agent.appended.length, 1, '换不到模型也不能把输入丢掉')
 })
@@ -554,13 +574,143 @@ test('非渠道级错误不触发自动重跑', async () => {
   assert.strictEqual(agent.followups.length, 0)
 })
 
-// ---------- 回归：这两个事件的载荷里没有 agent ----------
+// ---------- 目标模型撑不住上下文（MODEL_SWITCH_COMPACTION_FAILED）----------
+
+test('装不下上下文时退回上一个提交过请求的模型，而不是继续往前轮换', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  const h = harness({ llm: fakeLlm(() => 'ok') })
+  const sink = {}
+  const agent = Object.assign(agentAt(FREE[1], sink), {
+    status: 'idle',
+    whenIdle: async () => {},
+    followups: [],
+    followup: message => { agent.followups.push(message) },
+    session: { requestHeader: () => ({ config: { provider: FREE[0].provider, model: FREE[0].model } }) },
+  })
+  await h.fail(agent, { code: 'MODEL_SWITCH_COMPACTION_FAILED' })
+  assert.deepStrictEqual(sink.picked, FREE[0], '退回上一个真正跑通的模型')
+  assert.strictEqual(agent.followups.length, 1, '用同一轮历史重跑')
+})
+
+test('装不下上下文且没有可退回的模型时，把输入还回去', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  const h = harness({ llm: fakeLlm(() => 'ok') })
+  const agent = recoverableAgent({ header: undefined })
+  h.claim(agent, userMessage())
+  await h.fail(agent, { code: 'MODEL_SWITCH_COMPACTION_FAILED' })
+  assert.strictEqual(agent.appended.length, 1, '退不回去也不能把输入弄丢')
+})
+
+test('退回目标与当前模型相同时不重复切换', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  const h = harness({ llm: fakeLlm(() => 'ok') })
+  const sink = {}
+  const agent = Object.assign(agentAt(FREE[0], sink), {
+    status: 'idle',
+    whenIdle: async () => {},
+    followups: [],
+    followup: message => { agent.followups.push(message) },
+    // 请求头已经就是当前模型：没有可退回的目标
+    session: { requestHeader: () => ({ config: { provider: FREE[0].provider, model: FREE[0].model } }) },
+  })
+  await h.fail(agent, { code: 'MODEL_SWITCH_COMPACTION_FAILED' })
+  assert.strictEqual(sink.picked, undefined, '不该切到自己')
+})
+
+// ---------- 回填的时序：必须等驱动收尾 ----------
+
+test('回填发生在这一轮彻底跑完之后，否则驱动会立刻把消息吃掉', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  const h = harness({ llm: fakeLlm(() => 'ok'), config: { autoRetryOnFailure: 0 } })
+  const agent = recoverableAgent()
+  h.claim(agent, userMessage())
+  await h.fail(agent, { code: 'TRANSPORT' })
+  assert.deepStrictEqual(
+    agent.timeline,
+    ['whenIdle', 'append'],
+    '顺序必须是先 whenIdle 再入队',
+  )
+})
+
+test('真实码生效：QUOTA 触发处理，旧表里的假码不再误伤', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  const h = harness({ llm: fakeLlm(() => 'ok') })
+  const sink = {}
+  const agent = Object.assign(agentAt(FREE[0], sink), {
+    status: 'idle',
+    whenIdle: async () => {},
+    followups: [],
+    followup: message => { agent.followups.push(message) },
+  })
+  await h.fail(agent, { code: 'QUOTA' })
+  assert.deepStrictEqual(sink.picked, FREE[1], 'QUOTA 是 DSH 的真实码，应当被处理')
+
+  const h2 = harness({ llm: fakeLlm(() => 'ok') })
+  const sink2 = {}
+  const agent2 = Object.assign(agentAt(FREE[0], sink2), {
+    status: 'idle',
+    whenIdle: async () => {},
+    followups: [],
+    followup: message => { agent2.followups.push(message) },
+  })
+  // QUOTA_EXCEEDED 在 DSH 里不存在，不该被当成渠道故障
+  await h2.fail(agent2, { code: 'QUOTA_EXCEEDED' })
+  assert.strictEqual(sink2.picked, undefined, '不存在的码不该触发任何动作')
+})
 
 test('agent/error 与 agent/inbox/claimed 都按 agent 注册，不依赖载荷里的 agent', async () => {
   const h = harness({ config: { autoRetryOnFailure: 0 } })
   const agent = recoverableAgent()
   // harness 只在 agent.ctx 上投递，载荷里没有 agent 字段
   h.claim(agent, userMessage())
-  await h.fail(agent, { code: 'QUOTA_EXCEEDED' })
+  await h.fail(agent, { code: 'QUOTA' })
   assert.strictEqual(agent.appended.length, 1, '能在 agent.ctx 上收到事件并拿到 agent')
+})
+
+// ---------- 切换前的上下文容量检查 ----------
+
+test('没声明 contextWindow 的候选连探测都不做（切过去会以压缩失败结束整轮）', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  const log = { calls: [], infoCalls: [] }
+  const llm = fakeLlm(() => 'ok', log, new Set([`${FREE[1].provider}/${FREE[1].model}`]))
+  const sink = {}
+  await harness({ llm }).fire(agentAt(FREE[0], sink))
+  assert.ok(
+    !log.calls.includes(`${FREE[1].provider}/${FREE[1].model}`),
+    '容量不合格的候选不该被探测',
+  )
+  // 顺序是 loomy(不合格) → codearts(合格)，所以落到 codearts
+  assert.deepStrictEqual(sink.picked, LIST[0], '跳过不合格项，落到下一个合格项')
+})
+
+test('跳过容量不合格项，选中再下一个合格项', async () => {
+  const list = [
+    { provider: 'codearts', model: 'deepseek-v4.1-flash' },
+    { provider: 'trae', model: 'DeepSeek-V4-Pro' },
+    { provider: 'loomy', model: 'deepseek-v4-flash-0731' },
+    { provider: 'raccoon', model: 'sn-deepseek-v4-1-flash-1017' },
+  ]
+  writeWhitelist({ at: Date.now(), models: list })
+  const log = { calls: [], infoCalls: [] }
+  const llm = fakeLlm(() => 'ok', log, new Set(['trae/DeepSeek-V4-Pro']))
+  const sink = {}
+  await harness({ llm }).fire(agentAt(list[0], sink))
+  assert.deepStrictEqual(sink.picked, list[2], '跳过装不下的 trae，落到 loomy')
+})
+
+test('resolveModelInfo 抛错时不拦，交给探测判定', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  const llm = fakeLlm(() => 'ok')
+  llm.resolveModelInfo = async () => { throw new Error('boom') }
+  const sink = {}
+  await harness({ llm }).fire(agentAt(FREE[0], sink))
+  assert.deepStrictEqual(sink.picked, FREE[1], '查不出来就不该阻止轮换')
+})
+
+test('没有 resolveModelInfo 时照常轮换', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  const llm = fakeLlm(() => 'ok', { calls: [] }, undefined, true)
+  const sink = {}
+  await harness({ llm }).fire(agentAt(FREE[0], sink))
+  assert.deepStrictEqual(sink.picked, FREE[1])
 })
