@@ -132,6 +132,16 @@ export function apply(ctx, config) {
   const recoverInput = config?.recoverFailedInput !== false
   const maxRequeue = Math.floor(positive(config?.maxRequeuePerMessage, 2))
 
+  /**
+   * 渠道级故障后自动换模型重跑的轮数上限。0 = 关掉自动重跑，只做记账与回填。
+   * 默认 2：够跨过一次抖动，整池都挂时也不会无限打转。
+   */
+  const autoRetryRaw = config?.autoRetryOnFailure
+  const autoRetry = Number.isFinite(autoRetryRaw) && autoRetryRaw >= 0 ? Math.floor(autoRetryRaw) : 2
+
+  /** 每个 agent 已自动重跑的轮数；一轮顺利跑完后清零。 */
+  const retries = new WeakMap()
+
   /** 健康度缓存：`provider/model` → { ok, at }。探测结果按 TTL 复用，避免每轮都打网络。 */
   const health = new Map()
 
@@ -294,6 +304,9 @@ export function apply(ctx, config) {
       if (signal.aborted) return
       if (isSubagent(agent)) return
 
+      // 这一轮顺利跑完：把自动重试额度还回去，下一轮重新给满
+      retries.set(agent, 0)
+
       const list = readRotationList()
       if (list === undefined) return
 
@@ -314,64 +327,143 @@ export function apply(ctx, config) {
     }
   })
 
-  // 记住每轮被取走的用户消息，失败时可能要把它放回队列
-  ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
-    try {
-      claimed.set(agent, { message, turn })
-    } catch {
-      // 失败安全
+  /**
+   * 触发一次「用同一轮历史重跑」的隐形消息。
+   *
+   * 为什么需要它：请求失败时用户那条消息**已经写进日志**了（step 在发请求前就 append），
+   * 而 agent 空闲后再唤醒时，若 inbox 为空，`turn()` 会直接判定本轮 completed、不发请求。
+   * 所以必须放一条消息进队列把驱动叫起来。
+   *
+   * 为什么用 runtime-context：step 对这类消息只提交**当前**的运行时上下文快照，
+   * 不提交消息本身，所以它不会在对话历史里留下一行，用户看不到任何多余内容。
+   */
+  function triggerMessage() {
+    return {
+      id: randomUUID(),
+      role: 'user',
+      source: { kind: 'runtime-context' },
+      content: [],
     }
-  })
+  }
 
-  // 真实调用失败（且是渠道级故障）时做两件事：
-  //   1. 把这个模型记账为不可用，下一轮不再选它（补上探测与实际调用之间的时间差）
-  //   2. 如果用户这条消息根本没写进日志，就把原文放回队列，别把输入吃掉
-  ctx.on('agent/error', ({ agent, turn, error }) => {
-    try {
-      const code = error?.failure?.code ?? error?.code
-      if (typeof code !== 'string' || !CHANNEL_FAILURE_CODES.has(code)) return
+  /**
+   * 把本轮输入放回队列，让用户换模型后能直接重发。
+   * 只在内容确实没进日志时使用；已经落盘的消息交给对话列表显示即可，放进队列会重复。
+   */
+  function queueInputBack(agent, turn, code) {
+    if (!recoverInput || isSubagent(agent)) return
 
-      const current = agent.model?.current?.()
-      if (current !== undefined && typeof current.provider === 'string' && typeof current.model === 'string') {
-        health.set(keyOf(current), { ok: false, at: Date.now() })
-        ctx.logger?.warn?.(`${statePrefix}: ${keyOf(current)} 调用失败（${code}），暂时移出轮换`)
-      }
+    const pending = claimed.get(agent)
+    if (pending === undefined || pending.turn !== turn) return
 
-      // 子代理的输入是父代理给的，不该被当成用户输入回填
-      if (!recoverInput || isSubagent(agent)) return
+    // 已经写进日志 → 内容没丢，交给对话列表显示即可，不重复入队
+    if (recorded(agent.session, pending.message.id)) return
 
-      const pending = claimed.get(agent)
-      if (pending === undefined || pending.turn !== turn) return
+    const text = textOf(pending.message.content)
+    if (text === '') return
 
-      // 已经写进日志 → 内容没丢，交给对话列表显示即可，不重复入队
-      if (recorded(agent.session, pending.message.id)) return
+    // 防循环：同一段原文反复失败时不再无限入队
+    let counts = requeued.get(agent)
+    if (counts === undefined) {
+      counts = new Map()
+      requeued.set(agent, counts)
+    }
+    const count = counts.get(text) ?? 0
+    if (count >= maxRequeue) {
+      ctx.logger?.warn?.(`${statePrefix}: 同一段输入已重新入队 ${count} 次，本次不再入队，避免死循环`)
+      return
+    }
+    counts.set(text, count + 1)
 
-      const text = textOf(pending.message.content)
-      if (text === '') return
+    // 队列不唤醒驱动：放回去只是为了让用户能换模型后自己重发
+    agent.inbox.append('next-turn', {
+      id: randomUUID(),
+      role: 'user',
+      source: { kind: 'user' },
+      content: pending.message.content,
+    })
+    ctx.logger?.info?.(`${statePrefix}: 模型调用失败（${code}），已把该轮输入放回队列，可换模型后重发`)
+  }
 
-      // 防循环：同一段原文反复失败时不再无限入队
-      let counts = requeued.get(agent)
-      if (counts === undefined) {
-        counts = new Map()
-        requeued.set(agent, counts)
-      }
-      const count = counts.get(text) ?? 0
-      if (count >= maxRequeue) {
-        ctx.logger?.warn?.(`${statePrefix}: 同一段输入已重新入队 ${count} 次，本次不再入队，避免死循环`)
+  /**
+   * 渠道级故障的兜底处理，按代价从低到高依次尝试：
+   *   1. 把出故障的模型记账为不可用（补上「探测通过」与「真实调用」之间的时间差）
+   *   2. 自动换到下一个确认可用的模型，用同一轮历史重跑——用户无感
+   *   3. 重跑额度用尽或换不到模型时，把输入放回队列，让用户手工换模型重发
+   *
+   * 之所以能重跑：用户那条消息失败时已经在日志里了，模型下一轮请求会带上它，
+   * 所以只要能再发起一次请求，这一轮就被救回来了。
+   */
+  async function handleFailure(agent, turn, error) {
+    const code = error?.failure?.code ?? error?.code
+    if (typeof code !== 'string' || !CHANNEL_FAILURE_CODES.has(code)) return
+
+    const current = agent.model?.current?.()
+    const currentKnown = current !== undefined && typeof current.provider === 'string' && typeof current.model === 'string'
+    if (currentKnown) {
+      health.set(keyOf(current), { ok: false, at: Date.now() })
+      ctx.logger?.warn?.(`${statePrefix}: ${keyOf(current)} 调用失败（${code}），暂时移出轮换`)
+    }
+
+    // 子代理的输入是父代理给的，重跑与回填都不该由这里做
+    if (isSubagent(agent)) return
+
+    const used = retries.get(agent) ?? 0
+    if (autoRetry > 0 && used < autoRetry && currentKnown) {
+      const list = readRotationList()
+      const next = list === undefined ? undefined : await pickNext(list, current)
+      if (next !== undefined && !(next.provider === current.provider && next.model === current.model)) {
+        retries.set(agent, used + 1)
+        agent.model.select(next)
+        // 等本轮真正收尾再唤醒：在 agent/error 里同步重入驱动会撞上正在结束的这一轮
+        await agent.whenIdle?.()
+        if (agent.status === 'idle') {
+          agent.followup(triggerMessage())
+          ctx.logger?.info?.(
+            `${statePrefix}: ${keyOf(current)} 故障（${code}），已自动切到 ${keyOf(next)}，用同一轮历史重试（第 ${used + 1}/${autoRetry} 次）`,
+          )
+          return
+        }
+        // 用户已经发了新消息（或 agent 又被唤醒）：让那一轮自然跑，不要插队
+        ctx.logger?.info?.(`${statePrefix}: 已切到 ${keyOf(next)}，但 agent 不空闲，交给下一次输入`)
         return
       }
-      counts.set(text, count + 1)
+      ctx.logger?.warn?.(`${statePrefix}: 换不到可用模型，本轮不再自动重试`)
+    }
 
-      // 队列不唤醒驱动：放回去只是为了让用户能换模型后自己重发
-      agent.inbox.append('next-turn', {
-        id: randomUUID(),
-        role: 'user',
-        source: { kind: 'user' },
-        content: pending.message.content,
+    queueInputBack(agent, turn, code)
+  }
+
+  /**
+   * 每个 Agent 单独注册这两个监听。
+   *
+   * 必须按 agent 注册而不是在根 ctx 上听：`agent/error` 的载荷是
+   * `{ turn, step, error }`、`agent/inbox/claimed` 是 `{ message, turn }`，
+   * **都不含 agent**。在根 ctx 上听只能拿到 undefined，回填与记账会静默失效。
+   */
+  ctx.on('agent/created', ({ agent }) => {
+    try {
+      const scope = agent?.ctx
+      if (scope === undefined || typeof scope.on !== 'function') return
+
+      // 记住每轮被取走的用户消息，失败时可能要把它放回队列
+      scope.on('agent/inbox/claimed', ({ message, turn }) => {
+        try {
+          // 只看真实用户输入。runtime-context 是我们自己的重跑触发器，
+          // 若把它记进来，重跑再失败时回填的就是空内容，真正的输入反而被顶掉。
+          if (message?.source?.kind === 'runtime-context') return
+          claimed.set(agent, { message, turn })
+        } catch {
+          // 失败安全
+        }
       })
-      ctx.logger?.info?.(`${statePrefix}: 模型调用失败（${code}），已把该轮输入放回队列，可换模型后重发`)
+
+      scope.on('agent/error', ({ turn, error }) => {
+        // 不能 await：这个事件在 turn 内部同步 emit，等它会和正在收尾的驱动互相死锁
+        void handleFailure(agent, turn, error).catch(() => {})
+      })
     } catch {
-      // 失败安全：这只是兜底，不该影响对话
+      // 失败安全
     }
   })
 }

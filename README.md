@@ -38,9 +38,23 @@ DSH 开启一步时先解析模型路由、准备适配器，**成功之后**才
 - 该消息**没有**出现在会话日志的 `user/message` 里（否则内容没丢，无需重复）
 - 同一段原文累计回填次数没超过 `maxRequeuePerMessage`
 
-队列**不会自动触发重跑**。唯一例外是你当时还有待处理的 steering，
-那时驱动的收尾可能唤醒队列——这种情况下重发的消息会用同一个坏模型再失败一次，
-但被 `maxRequeuePerMessage`（默认 2）兜住，不会死循环。
+## 失败后自动换模型重跑
+
+回填是最后一道防线。更常见的情况是这条消息**已经写进日志**了（DSH 在发请求前就落盘），
+内容没丢，但这一轮任务断了。这时插件会先尝试自愈：
+
+1. 把出故障的模型记账为不可用，下一轮轮换避开它
+2. 换到下一个探测通过的模型
+3. 唤醒驱动，**用同一轮历史重新发一次请求**
+
+第 3 步能成立，是因为失败时用户那条消息已经在日志里，模型下一次请求会自然带上它 ——
+只要能再发起一次请求，这一轮就被救回来了。
+
+叫醒驱动用的是一条 `runtime-context` 类型的隐形消息：DSH 对这类消息只提交当前的运行时
+上下文快照、不提交消息本身，所以它**不会在对话历史里留下多出来的一行**，你看不到任何痕迹。
+
+额度由 `autoRetryOnFailure`（默认 2）控制，一轮顺利跑完之后清零。用尽或换不到可用模型时，
+才回落到上面的「放回队列」，让你手工换模型重发。
 
 > 放回的是队列而不是输入框正文：草稿正文归客户端 shell 的 Lexical 编辑器所有，
 > Host 侧没有稳定写入口。
@@ -65,6 +79,11 @@ DSH 开启一步时先解析模型路由、准备适配器，**成功之后**才
 `agent/error` 会按错误码把该模型记账为不可用，下一轮不再选它。
 只有渠道级错误码（`QUOTA_EXCEEDED`、`TRANSPORT`、`AUTH`、`UNAVAILABLE`、`UNKNOWN_MODEL` 等）
 才会触发，工具报错之类的不会错杀健康模型。
+
+> `agent/error` 与 `agent/inbox/claimed` 的载荷里**没有 `agent`**
+> （分别是 `{ turn, step, error }` 和 `{ message, turn }`）。
+> 所以这两个监听必须挂在 `agent/created` 拿到的 `agent.ctx` 上、用闭包捕获 agent；
+> 挂在根 `ctx` 上拿到的永远是 `undefined`，整套回填与记账会**静默失效**。
 
 故障时日志（`warn` 级）会带上每个候选的失败原因，例如：
 
@@ -146,7 +165,8 @@ config:
 | `verifyTtlMs` | `900000` | 探测结果缓存时长（15 分钟） |
 | `verifyCandidates` | `3` | 每轮并行探测的候选上限 |
 | `includeSubagents` | `false` | 设为 `true` 让子代理也参与轮换 |
-| `recoverFailedInput` | `true` | 模型失败时是否把本轮输入放回队列 |
+| `autoRetryOnFailure` | `2` | 渠道故障后自动换模型重跑的轮数上限；`0` = 只回填、不自动重跑 |
+| `recoverFailedInput` | `true` | 重跑用尽后是否把本轮输入放回队列 |
 | `maxRequeuePerMessage` | `2` | 同一段输入最多被放回队列几次 |
 | `statePrefix` | `round-robin` | 日志前缀 |
 
@@ -162,6 +182,7 @@ config:
         verifyBeforeSwitch: true
         verifyCandidates: 3
         includeSubagents: false
+        autoRetryOnFailure: 2
 ```
 
 ## 为什么默认跳过子代理
@@ -170,13 +191,14 @@ config:
 
 ## 失败安全
 
-轮换和回填都是锦上添花的东西，所以每个回调都包在 try/catch 里：
+轮换、探测、重跑和回填都是锦上添花的东西，所以每个回调都包在 try/catch 里：
 
 - 白名单不可用 → 不轮换，保持原样
 - `agent.model` 缺失或 `select()` 抛错 → 忽略
 - 信号已中止（用户取消） → 不轮换
 - 读不到会话日志 → 当作「消息已记录」，不重复回填
 - `inbox.append` 抛错 → 忽略
+- 自动重跑换不到模型 → 回落到回填
 
 最坏情况就是「模型不轮换了」或「输入没回填」，不会让对话失败。
 
