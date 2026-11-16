@@ -714,3 +714,38 @@ test('没有 resolveModelInfo 时照常轮换', async () => {
   await harness({ llm }).fire(agentAt(FREE[0], sink))
   assert.deepStrictEqual(sink.picked, FREE[1])
 })
+
+// ---------- 合并自另一台机器（银河麒麟 + Docker web 版）的本机补丁 ----------
+
+test('verifyBeforeSwitch=false 时仍然跳过没有 contextWindow 的候选', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  const log = { calls: [], infoCalls: [] }
+  const llm = fakeLlm(() => 'ok', log, new Set([`${FREE[1].provider}/${FREE[1].model}`]))
+  const sink = {}
+  // 关闭探测：这条路径不会调用 probe()，容量闸门只能靠 pickNext 自己兜
+  await harness({ llm, config: { verifyBeforeSwitch: false } }).fire(agentAt(FREE[0], sink))
+  assert.deepStrictEqual(sink.picked, LIST[0], '不探测也必须跳过装不下的候选')
+  assert.deepStrictEqual(log.calls, [], '关闭探测时不该有任何真实调用')
+})
+
+test('verifyBeforeSwitch=false 且全部装不下时保持当前模型', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  const noCapacity = new Set(LIST.map(entry => `${entry.provider}/${entry.model}`))
+  const llm = fakeLlm(() => 'ok', { calls: [] }, noCapacity)
+  const sink = {}
+  await harness({ llm, config: { verifyBeforeSwitch: false } }).fire(agentAt(FREE[0], sink))
+  assert.strictEqual(sink.picked, undefined, '一个都装不下就不该切')
+})
+
+test('容量结论走缓存：连续两轮只问一次 resolveModelInfo', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  const log = { calls: [], infoCalls: [] }
+  const llm = fakeLlm(() => 'ok', log)
+  const h = harness({ llm, config: { verifyBeforeSwitch: false } })
+  const sink = {}
+  await h.fire(agentAt(FREE[0], sink))
+  const afterFirst = log.infoCalls.length
+  assert.ok(afterFirst > 0, '第一轮应当问过容量')
+  await h.fire(agentAt(FREE[0], sink))
+  assert.strictEqual(log.infoCalls.length, afterFirst, '缓存命中后不该再问')
+})

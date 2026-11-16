@@ -94,6 +94,13 @@ DSH 的模型切换压缩要求目标模型具备**已声明的上下文容量**
 所以容量要在探测**之前**单独问一次，把这类模型挡在轮换之外。
 两项检查共用同一份 15 分钟缓存，因此每个候选最多每 15 分钟问一次。
 
+容量闸门**同时**挂在 `pickNext` 和 `probe` 上，不是只挂在探测里：
+`verifyBeforeSwitch: false` 时 `pickNext` 根本不探测，若闸门只在 `probe` 里，
+那条路径就完全没有保护 —— 2026-11-09 本机巡检正是被
+`raccoon/sn-deepseek-v4-1-flash-1016`（没上报 `contextWindow`）在这条路径上打死的。
+`health` 缓存命中「可用」的候选会跳过容量问询，因为 `probe` 是「先过容量、再探测」，
+`ok: true` 已经隐含容量合格。
+
 ### 错误码必须抄 DSH 的，不能猜
 
 上面那张触发记账的码表必须与 DSH 的 `LLM_FAILURE_CODES`
@@ -222,6 +229,26 @@ config:
         includeSubagents: false
         autoRetryOnFailure: 2
 ```
+
+### 白名单路径为什么不写进插件自带的 patch
+
+本仓库的 `cordis.patch.yml` 永远是 `config: {}`，**不放任何具体路径**。
+一条 `/workspace/...` 或 `C:\...` 这样的路径一旦跟着代码走，换台机器装就必然读不到白名单，
+而白名单读不到的后果是四个渠道的全部模型一起摊进选择器。
+
+机器相关的路径放在**该机器 profile 的 `cordis.patch.yml`** 里（loader 会在所有 bundle 层之后应用它，
+`- id:` 定向覆盖整段 `config`）：
+
+```yaml
+# $DSH_HOME/profiles/<name>/cordis.patch.yml —— 只属于这台机器，不进 git
+- id: deepseek-model-round-robin
+  name: 'dsh-deepseek-model-round-robin'
+  config:
+    whitelistPath: /workspace/dsh使用/免费模型巡检/whitelist.json
+```
+
+路径全用 `node:path` / `os.homedir()` 拼接，没有写死的分隔符，Windows 与 Linux 同一份代码可用；
+仓库里也不该出现任何绝对路径。
 
 ## 为什么默认跳过子代理
 

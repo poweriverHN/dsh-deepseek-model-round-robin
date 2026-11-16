@@ -183,6 +183,14 @@ export function apply(ctx, config) {
   /** 健康度缓存：`provider/model` → { ok, at }。探测结果按 TTL 复用，避免每轮都打网络。 */
   const health = new Map()
 
+  /**
+   * 容量缓存：`provider/model` → { ok, at }。与 {@link health} 分开存。
+   *
+   * 不能合用：`health` 里 `ok: true` 意味着「探测过、能用」，而容量合格只说明
+   * 「装得下上下文」，**不代表真能出字**。合到一起会让容量检查顺带把探测也跳过。
+   */
+  const capacity = new Map()
+
   /** 每个 agent 最近一次被取走的用户消息，用于失败后回填。 */
   const claimed = new WeakMap()
   /** 每个 agent 的「原文 → 已重新入队次数」，防止死循环。 */
@@ -262,6 +270,13 @@ export function apply(ctx, config) {
     return Date.now() - hit.at < verifyTtlMs ? hit.ok : undefined
   }
 
+  /** 容量缓存里新鲜的结论；没有则 undefined。 */
+  function cachedCapacity(entry) {
+    const hit = capacity.get(keyOf(entry))
+    if (hit === undefined) return undefined
+    return Date.now() - hit.at < verifyTtlMs ? hit.ok : undefined
+  }
+
   /**
    * 这个模型能不能当**切换目标**。
    *
@@ -270,21 +285,31 @@ export function apply(ctx, config) {
    * 切过去，整轮就以 `MODEL_SWITCH_COMPACTION_FAILED` 结束，用户那条消息白打。
    * 所以轮换前先问一次，把这类模型直接排除，而不是等它把这一轮打掉再补救。
    *
+   * 结论走 {@link capacity} 缓存（同一个 TTL），所以每个候选最多每 15 分钟问一次，
+   * 不会因为每轮轮换都打一遍 `resolveModelInfo`。
+   *
    * 问不到时一律返回 true（没有 llm、方法不存在、调用抛错）：查不出来就不该拦，
    * 交给后面的可用性探测和失败兜底去处理。
    *
    * @returns {Promise<boolean>}
    */
   async function switchable(entry) {
+    const cached = cachedCapacity(entry)
+    if (cached !== undefined) return cached
+
     const llm = ctx.get?.('llm')
     if (llm === undefined || typeof llm.resolveModelInfo !== 'function') return true
+    let ok = true
     try {
       const info = await llm.resolveModelInfo(entry.provider, entry.model, AbortSignal.timeout(verifyTimeoutMs))
-      if (info === undefined || info === null) return true
-      return info.context !== undefined
+      // `context` 存在即代表适配器声明了上下文容量（`LlmModelContext.contextWindow` 是必填）。
+      ok = info === undefined || info === null || info.context !== undefined
     } catch {
+      // 查不出来就不该拦，也不能把「问不到」当成「装不下」缓存下来
       return true
     }
+    capacity.set(keyOf(entry), { ok, at: Date.now() })
+    return ok
   }
 
   /**
@@ -346,11 +371,34 @@ export function apply(ctx, config) {
     const ordered = []
     for (let i = 1; i <= list.length; i++) ordered.push(list[((pos < 0 ? -1 : pos) + i) % list.length])
 
-    if (!verify) return ordered[0]
+    /**
+     * 容量闸门放在这里，而不是只放在 {@link probe} 里。
+     *
+     * `verify: false` 的配置下 `pickNext` 根本不做探测，只看顺序取第一个；
+     * 若容量检查只挂在探测里，这条路就完全没有闸门 —— 正好是本机 2026-11-09
+     * 巡检被 `raccoon/sn-deepseek-v4-1-flash-1016` 打死的那条路径。
+     *
+     * 健康缓存命中 `true` 的不用再问：`probe` 是「先过容量、再探测」，
+     * 所以缓存在 `health` 里的 `ok: true` 已经隐含容量合格。
+     */
+    const viable = []
+    for (const entry of ordered) {
+      const known = cachedHealth(entry)
+      // 已知不可用（探测失败）的在下面那一轮本来也会被跳过，不必再问容量
+      if (known === false) continue
+      if (known !== true && !(await switchable(entry))) {
+        ctx.logger?.debug?.(`${statePrefix}: 跳过 ${keyOf(entry)}（未上报上下文窗口，切过去会以压缩失败结束整轮）`)
+        continue
+      }
+      viable.push(entry)
+    }
+    if (viable.length === 0) return undefined
+
+    if (!verify) return viable[0]
 
     // 第一轮：只看缓存。命中的健康项直接选；已知不健康的跳过（不重复打网络）。
     const needProbe = []
-    for (const entry of ordered) {
+    for (const entry of viable) {
       const known = cachedHealth(entry)
       if (known === true) return entry
       if (known === false) continue
