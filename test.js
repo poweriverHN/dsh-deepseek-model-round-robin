@@ -272,17 +272,23 @@ test('DeepSeek 官方渠道默认不参与轮换', async () => {
   assert.ok(!log.calls.some(c => c.startsWith('deepseek-official/')), '绝不探测官方渠道')
 })
 
-test('excludeProviders 为空时所有渠道都参与轮换', async () => {
-  writeWhitelist({ at: Date.now(), models: LIST })
+test('excludeProviders 配成空数组也去不掉官方渠道', async () => {
+  // 官方/付费渠道恒在排除名单里：配置只能往上加，不能清空。
+  const OFFICIAL = { provider: 'deepseek-official', model: 'deepseek-chat' }
+  writeWhitelist({ at: Date.now(), rotateExclude: [], models: [OFFICIAL, LIST[0], LIST[1]] })
   const sink = {}
-  await harness({ llm: fakeLlm(() => 'ok'), config: { excludeProviders: [] } })
+  const log = { calls: [] }
+  await harness({ llm: fakeLlm(() => 'ok', log), config: { excludeProviders: [] } })
     .fire(agentAt(LIST[0], sink))
   assert.deepStrictEqual(sink.picked, LIST[1])
+  assert.ok(!log.calls.some(c => c.startsWith('deepseek-official/')), '官方渠道仍在池外')
 })
 
-test('白名单的 rotateExclude 覆盖内置默认', async () => {
-  // 只排 trae：codearts 是普通渠道、没写进 rotateExclude，因此留在池里
-  writeWhitelist({ at: Date.now(), rotateExclude: ['trae'], models: LIST })
+test('白名单的 rotateExclude 只追加，不覆盖内置默认', async () => {
+  // 只排 trae：codearts 是普通渠道、没写进 rotateExclude，因此留在池里；
+  // 官方渠道没写进 rotateExclude，仍然被内置默认排掉。
+  const OFFICIAL = { provider: 'deepseek-official', model: 'deepseek-chat' }
+  writeWhitelist({ at: Date.now(), rotateExclude: ['trae'], models: [OFFICIAL, ...LIST] })
   const sink = {}
   await harness({ llm: fakeLlm(() => 'ok') }).fire(agentAt(LIST[0], sink))
   assert.deepStrictEqual(sink.picked, LIST[2], '池里是 codearts + loomy，codearts 的下一个是 loomy')
@@ -632,7 +638,7 @@ test('回填发生在这一轮彻底跑完之后，否则驱动会立刻把消�
   )
 })
 
-test('真实码生效：QUOTA 触发处理，旧表里的假码不再误伤', async () => {
+test('真实码生效：核心的 QUOTA 与 pack 的 QUOTA_EXCEEDED 都算渠道故障', async () => {
   writeWhitelist({ at: Date.now(), models: LIST })
   const h = harness({ llm: fakeLlm(() => 'ok') })
   const sink = {}
@@ -643,8 +649,10 @@ test('真实码生效：QUOTA 触发处理，旧表里的假码不再误伤', as
     followup: message => { agent.followups.push(message) },
   })
   await h.fail(agent, { code: 'QUOTA' })
-  assert.deepStrictEqual(sink.picked, FREE[1], 'QUOTA 是 DSH 的真实码，应当被处理')
+  assert.deepStrictEqual(sink.picked, FREE[1], 'QUOTA 是 DSH 核心的真实码，应当被处理')
 
+  // loomy/trae/qoder 从 channel-pack 抛的是带后缀的 QUOTA_EXCEEDED，
+  // 不在核心码表里但真实存在。漏掉它会让自动切换与回填全部静默失效。
   const h2 = harness({ llm: fakeLlm(() => 'ok') })
   const sink2 = {}
   const agent2 = Object.assign(agentAt(FREE[0], sink2), {
@@ -653,9 +661,24 @@ test('真实码生效：QUOTA 触发处理，旧表里的假码不再误伤', as
     followups: [],
     followup: message => { agent2.followups.push(message) },
   })
-  // QUOTA_EXCEEDED 在 DSH 里不存在，不该被当成渠道故障
   await h2.fail(agent2, { code: 'QUOTA_EXCEEDED' })
-  assert.strictEqual(sink2.picked, undefined, '不存在的码不该触发任何动作')
+  assert.deepStrictEqual(sink2.picked, FREE[1], 'QUOTA_EXCEEDED 是 pack 的真实码，应当被处理')
+  assert.strictEqual(agent2.followups.length, 1, '并且用同一轮历史自动重跑，不需要人工“继续”')
+})
+
+test('从未在 DSH 出现过的码不误伤：RATE_LIMITED / UNAUTHORIZED 之类仍然不处理', async () => {
+  const h = harness({ llm: fakeLlm(() => 'ok') })
+  for (const code of ['RATE_LIMITED', 'UNAUTHORIZED', 'UNAVAILABLE', 'NO_CREDENTIAL']) {
+    const sink = {}
+    const agent = Object.assign(agentAt(FREE[0], sink), {
+      status: 'idle',
+      whenIdle: async () => {},
+      followups: [],
+      followup: () => {},
+    })
+    await h.fail(agent, { code })
+    assert.strictEqual(sink.picked, undefined, `${code} 不该触发任何动作`)
+  }
 })
 
 test('agent/error 与 agent/inbox/claimed 都按 agent 注册，不依赖载荷里的 agent', async () => {

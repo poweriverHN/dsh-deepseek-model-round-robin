@@ -37,19 +37,30 @@ const DEFAULT_STALE_MINUTES = 180
 const DEFAULT_EXCLUDE_PROVIDERS = ['deepseek-official', 'deepseek-account']
 
 /**
- * 「这个渠道/模型现在服务不了请求」的失败码，抄自 DSH 的 `LLM_FAILURE_CODES`
- * （`@deepseek-ai/dsh-llm/error`）。只有这些才把模型标记为不可用，
- * 避免把工具报错、用户取消之类误判成渠道问题而错杀健康模型。
+ * 「这个渠道/模型现在服务不了请求」的失败码。
  *
- * 注意：这张表早先有一半是**凭印象编的**。`QUOTA_EXCEEDED`、`RATE_LIMITED`、
- * `UNAUTHORIZED`、`UNAVAILABLE`、`NO_CREDENTIAL` 在 DSH 里**根本不存在**，
- * 命中不了任何真实错误。真实码是 `QUOTA`、`RATE_LIMIT`、`ACCOUNT_TOKEN_INVALID`、
- * `SERVER`、`MISSING_CREDENTIAL` 等。要加码请照着上面那个模块抄，不要猜。
+ * 这张表有两类来源，**两套码并存**，漏掉任何一套都会让自动切换静默失效：
+ *
+ * 1. DSH 核心（`@deepseek-ai/dsh-llm` 的 `*_CODE` 常量）—— 注意常量名和值不一样：
+ *    `QUOTA_EXCEEDED_CODE === 'QUOTA'`、`ACCOUNT_QUOTA_EXCEEDED_CODE === 'ACCOUNT_QUOTA'`、
+ *    `EMPTY_RESPONSE_CODE === 'EMPTY_RESPONSE'`、`CONTEXT_WINDOW_EXCEEDED_CODE ===
+ *    'CONTEXT_WINDOW_EXCEEDED'`。pi-ai 那条路把上游错误归一到这几个码
+ *    （`classifyPiAiError` 返回 AUTH / QUOTA / RATE_LIMIT / INVALID_REQUEST /
+ *    SERVER / TIMEOUT / TRANSPORT / PI_AI_ERROR）。
+ *
+ * 2. `dsh-our-free-model` 的 channel-pack —— 它自建 `LlmError` 时用的是**自己的**码，
+ *    其中 `QUOTA_EXCEEDED`（注意带后缀，与核心的 `QUOTA` 不同）是真实存在、真会被抛的：
+ *    loomy、trae、qoder 等渠道额度耗尽时抛的就是它。2026-11-20 loomy 报
+ *    「积分余额不足，请获取积分后再试 / QUOTA_EXCEEDED」正是此码——当时表里没有它，
+ *    自动切换与回填全部没触发，只能人工换模型。
+ *
+ * 所以不要凭「DSH 里应该只有这些」删条目：pack 抛的码不在 DSH 核心码表里。
  */
 const FAILURE_CODES = new Set([
-  // 额度与限流
+  // 额度与限流（核心 QUOTA / ACCOUNT_QUOTA，pack QUOTA_EXCEEDED）
   'ACCOUNT_QUOTA',
   'QUOTA',
+  'QUOTA_EXCEEDED',
   'RATE_LIMIT',
   // 凭据
   'AUTH',
@@ -60,11 +71,15 @@ const FAILURE_CODES = new Set([
   'INVALID_CREDENTIAL',
   // 传输与服务端
   'TRANSPORT',
+  'NETWORK',
   'SERVER',
   'TIMEOUT',
   'STREAM_CLOSED',
   'EMPTY_RESPONSE',
   'MALFORMED_RESPONSE',
+  // 请求本身被拒（换模型常能过去：400 / 413 / 内容类型不支持）
+  'INVALID_REQUEST',
+  'UNSUPPORTED_CONTENT',
   // 适配器与模型
   'UNKNOWN_MODEL',
   'NO_ADAPTER',
@@ -155,8 +170,11 @@ export function apply(ctx, config) {
   const skipSubagents = config?.includeSubagents !== true
   const statePrefix = typeof config?.statePrefix === 'string' ? config.statePrefix : 'round-robin'
 
-  // 配置显式给出时优先（空数组 = 不排除任何渠道，允许付费模型参与轮换）
-  const excludeProviders = Array.isArray(config?.excludeProviders)
+  /**
+   * 额外排除的渠道。**只增不减**：官方/付费渠道（`DEFAULT_EXCLUDE_PROVIDERS`）
+   * 无论如何都不会回到轮换池——配成空数组也不行。
+   */
+  const extraExclude = Array.isArray(config?.excludeProviders)
     && config.excludeProviders.every(id => typeof id === 'string')
     ? config.excludeProviders
     : null
@@ -205,8 +223,8 @@ export function apply(ctx, config) {
   /**
    * 读取白名单并滤掉付费渠道。
    *
-   * 排除名单来源（优先级从高到低）：插件配置 `excludeProviders`
-   * → 白名单里的 `rotateExclude` → 内置默认（三个付费/官方渠道）。
+   * 排除名单**只增不减**：内置的官方/付费渠道恒在名单里（配置给空数组也去不掉），
+   * 插件配置 `excludeProviders` 与白名单里的 `rotateExclude` 只能在其上追加。
    * 逐项过滤后只剩 0 或 1 个时返回 undefined，调用方不轮换。
    */
   function readRotationList() {
@@ -243,10 +261,11 @@ export function apply(ctx, config) {
     if (!Number.isFinite(cachedAt) || cachedAt <= 0) return undefined
     if (Date.now() - cachedAt > cachedStaleMs) return undefined
 
-    const exclude = excludeProviders ?? cachedExclude ?? DEFAULT_EXCLUDE_PROVIDERS
-    const allowed = exclude.length === 0
-      ? cachedModels
-      : cachedModels.filter(entry => !exclude.includes(entry.provider))
+    // 官方/付费渠道恒在排除名单里，配置与白名单只能往上加。
+    const banned = new Set(DEFAULT_EXCLUDE_PROVIDERS)
+    for (const id of extraExclude ?? []) banned.add(id)
+    for (const id of cachedExclude ?? []) banned.add(id)
+    const allowed = cachedModels.filter(entry => !banned.has(entry.provider))
     return allowed.length <= 1 ? undefined : allowed
   }
 

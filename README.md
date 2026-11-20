@@ -101,21 +101,30 @@ DSH 的模型切换压缩要求目标模型具备**已声明的上下文容量**
 `health` 缓存命中「可用」的候选会跳过容量问询，因为 `probe` 是「先过容量、再探测」，
 `ok: true` 已经隐含容量合格。
 
-### 错误码必须抄 DSH 的，不能猜
+### 错误码有两套，两套都要认
 
-上面那张触发记账的码表必须与 DSH 的 `LLM_FAILURE_CODES`
-（`@deepseek-ai/dsh-llm/error`）一致。曾经这张表一半是凭印象写的：
+DSH 里的失败码来自两个地方，**名字不通用**：
 
-| 写的 | 实际 DSH 里的码 |
+1. **核心** `@deepseek-ai/dsh-llm` 的 `*_CODE` 常量 —— 注意常量名和值不一样：
+   `QUOTA_EXCEEDED_CODE === 'QUOTA'`、`ACCOUNT_QUOTA_EXCEEDED_CODE === 'ACCOUNT_QUOTA'`。
+   pi-ai 那条路把上游错误归一成 `AUTH` / `QUOTA` / `RATE_LIMIT` / `INVALID_REQUEST` /
+   `SERVER` / `TIMEOUT` / `TRANSPORT` / `PI_AI_ERROR`。
+2. **`dsh-our-free-model` 的 channel-pack** —— 它自建 `LlmError` 时用自己的码，
+   其中 `QUOTA_EXCEEDED`（带后缀）是真实存在、真会被抛的：loomy、trae、qoder
+   额度耗尽时抛的就是它。
+
+历史上这张表曾经一半是凭印象写的，改过一轮：
+
+| 曾经写的 | 结论 |
 | --- | --- |
-| `QUOTA_EXCEEDED` | `QUOTA`、`ACCOUNT_QUOTA` |
-| `RATE_LIMITED` | `RATE_LIMIT` |
-| `UNAUTHORIZED` | `AUTH`、`ACCOUNT_TOKEN_INVALID` |
-| `UNAVAILABLE` | `SERVER`、`TRANSPORT` |
-| `NO_CREDENTIAL` | `MISSING_CREDENTIAL`、`NO_CREDENTIAL_STORE` |
+| `QUOTA_EXCEEDED` | 一度被当成假码删掉，**删错了** —— pack 真的抛这个码。2026-11-20 loomy 报「积分余额不足 / QUOTA_EXCEEDED」时自动切换没有触发，就是这条 |
+| `RATE_LIMITED` | 假码，真实是 `RATE_LIMIT` |
+| `UNAUTHORIZED` | 假码，真实是 `AUTH`、`ACCOUNT_TOKEN_INVALID` |
+| `UNAVAILABLE` | 假码，真实是 `SERVER`、`TRANSPORT` |
+| `NO_CREDENTIAL` | 假码，真实是 `MISSING_CREDENTIAL`、`NO_CREDENTIAL_STORE` |
 
-这些不存在的码永远不会命中真实错误，等于九项里五项规定死了。
-新增错误码时照着那个模块抄。
+教训：不要按「DSH 核心里应该只有这些」去删条目。pack 的码不在核心码表里，
+删掉就等着某天自动切换静默失效。要用就直读 `pack.js` 里 `new LlmError(...)` 的第二个参数。
 
 **失败反馈**：如果探测通过、但真正调用时失败（两者之间的时间差），
 `agent/error` 会按错误码把该模型记账为不可用，下一轮不再选它，
@@ -182,29 +191,33 @@ plugin_manager  action=install_bundle  target=link:/path/to/dsh-deepseek-model-r
 
 `models` 的顺序就是轮换顺序。`rotateExclude` 里的渠道会先被踢掉，剩下的才参与轮换。
 
-## 为什么只排除 DeepSeek 官方
+## 为什么官方渠道永远不参与轮换
 
 轮换的初衷是别把单一渠道的额度薅干。DeepSeek **官方**渠道（`deepseek-official`、`deepseek-account`）走的是你自己的付费额度，一旦被自动切进去，就会在你不注意的时候产生真实费用 —— 这跟初衷相反。
 
-所以默认只把这两个官方渠道排除在轮换池外。它们在选择器里照常可见、随时可以手动选，只是不会被自动切过去。
+所以 `deepseek-official` / `deepseek-account` **恒在排除名单里**：配置里把 `excludeProviders` 写成 `[]` 也去不掉，白名单里把 `rotateExclude` 写成 `[]` 同样去不掉。这两个渠道在选择器里照常可见、随时可以手动选，只是不会被自动切过去。
 
 其余渠道（包括 `codearts`、`workbuddy-ai`、`workbuddy-cn` 这类带付费型号的第三方渠道）只要巡检能调通，就照常参与轮换：它们的额度是按渠道结算的赠送/订阅额度，轮换本来就是为了在这些渠道之间摊开用量。
 
-需要让付费渠道也参与轮换时：
+配置与白名单的排除名单都是**只增不减**：
 
 ```yaml
 config:
-  excludeProviders: []        # 空数组 = 不排除任何渠道
+  excludeProviders: ['loomy']   # 在官方渠道之外，再排掉 loomy
 ```
 
-或在白名单里把 `rotateExclude` 写成 `[]`。两者都省略时用内置默认。
+```json
+{ "rotateExclude": ["lobsterai"] }
+```
+
+两者会合并，再并上内置的官方渠道，一起从轮换池里滤掉。
 
 ## 配置
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `whitelistPath` | 见下 | 白名单路径 |
-| `excludeProviders` | 见下 | 不参与轮换的渠道；省略时读白名单 `rotateExclude`，再缺省用三个付费渠道 |
+| `excludeProviders` | `null` | 在官方渠道之外额外排除的渠道；与白名单 `rotateExclude` 合并，只能加、不能减 |
 | `verifyBeforeSwitch` | `true` | 切换前是否做真实调用探测 |
 | `verifyTimeoutMs` | `8000` | 单次探测超时 |
 | `verifyTtlMs` | `900000` | 探测结果缓存时长（15 分钟） |
