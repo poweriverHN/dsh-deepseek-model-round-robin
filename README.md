@@ -63,6 +63,11 @@ DSH 开启一步时先解析模型路由、准备适配器，**成功之后**才
 额度由 `autoRetryOnFailure`（默认 2）控制，一轮顺利跑完之后清零。用尽或换不到可用模型时，
 才回落到上面的「放回队列」，让你手工换模型重发。
 
+**额度耗尽的隔离期单独算**：`QUOTA` / `ACCOUNT_QUOTA` / `QUOTA_EXCEEDED` 不是抖动，
+要人工充值才恢复。用探测的 15 分钟 TTL 记账，它每 15 分钟就会回到轮换池，
+下一次轮换切过去再失败一次，用户又白看一遍「本轮运行失败」。所以这类码按
+`quotaQuarantineMs`（默认 6 小时）隔离。
+
 > 放回的是队列而不是输入框正文：草稿正文归客户端 shell 的 Lexical 编辑器所有，
 > Host 侧没有稳定写入口。
 
@@ -222,6 +227,7 @@ config:
 | `verifyTimeoutMs` | `8000` | 单次探测超时 |
 | `verifyTtlMs` | `900000` | 探测结果缓存时长（15 分钟） |
 | `verifyCandidates` | `3` | 每轮并行探测的候选上限 |
+| `quotaQuarantineMs` | `21600000` | 额度耗尽类失败的隔离时长（6 小时）；`0` = 不隔离，退回探测 TTL |
 | `includeSubagents` | `false` | 设为 `true` 让子代理也参与轮换 |
 | `autoRetryOnFailure` | `2` | 渠道故障后自动换模型重跑的轮数上限；`0` = 只回填、不自动重跑 |
 | `recoverFailedInput` | `true` | 重跑用尽后是否把本轮输入放回队列 |

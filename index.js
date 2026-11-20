@@ -108,6 +108,18 @@ const CAPACITY_CODES = new Set([
 ])
 
 /**
+ * 额度耗尽的码（核心的 `QUOTA`/`ACCOUNT_QUOTA`、pack 的 `QUOTA_EXCEEDED`）。
+ *
+ * 与 {@link FAILURE_CODES} 的区别只在隔离时长：这些不是抖动，要人工充值才恢复，
+ * 用 15 分钟的探测 TTL 会让它反复回到轮换池，每轮都白失败一次。
+ */
+const QUOTA_CODES = new Set([
+  'QUOTA',
+  'ACCOUNT_QUOTA',
+  'QUOTA_EXCEEDED',
+])
+
+/**
  * 解析白名单路径：显式配置 > 环境变量 > `~/.dsh/deepseek-whitelist.json`。
  * @param {string | undefined} configured
  * @returns {string}
@@ -187,6 +199,19 @@ export function apply(ctx, config) {
   // 失败后是否把本轮输入放回队列（默认开）
   const recoverInput = config?.recoverFailedInput !== false
   const maxRequeue = Math.floor(positive(config?.maxRequeuePerMessage, 2))
+
+  /**
+   * 额度类失败的隔离时长（默认 6 小时）。
+   *
+   * 「积分/余额不足」不是抖动，充值是人工动作，几分钟内不会恢复。用探测那个
+   * 15 分钟 TTL 会让它每 15 分钟又回到轮换池里，下一次轮换切过去再失败一次，
+   * 用户白看一次「本轮运行失败」。所以这类码单独给一个长隔离期。
+   */
+  const hardQuotaRaw = config?.quotaQuarantineMs
+  // 允许显式配 0 = 不隔离（退回探测的短 TTL），所以不能用 positive() 的「>0 才算数」语义
+  const hardQuotaMs = Number.isFinite(hardQuotaRaw) && hardQuotaRaw >= 0
+    ? Number(hardQuotaRaw)
+    : 6 * 60 * 60_000
 
   /**
    * 渠道级故障后自动换模型重跑的轮数上限。0 = 关掉自动重跑，只做记账与回填。
@@ -286,7 +311,9 @@ export function apply(ctx, config) {
   function cachedHealth(entry) {
     const hit = health.get(keyOf(entry))
     if (hit === undefined) return undefined
-    return Date.now() - hit.at < verifyTtlMs ? hit.ok : undefined
+    // 额度类失败的隔离期单独算：见 HARD_QUOTA_MS 的说明
+    const ttl = hit.ttlMs ?? verifyTtlMs
+    return Date.now() - hit.at < ttl ? hit.ok : undefined
   }
 
   /** 容量缓存里新鲜的结论；没有则 undefined。 */
@@ -564,10 +591,17 @@ export function apply(ctx, config) {
     const current = agent.model?.current?.()
     const currentKnown = current !== undefined && typeof current.provider === 'string' && typeof current.model === 'string'
     if (currentKnown) {
-      health.set(keyOf(current), { ok: false, at: Date.now() })
+      // 额度类给长隔离：充值才恢复，15 分钟后又切回去只会再白失败一次
+      const quota = QUOTA_CODES.has(code)
+      health.set(keyOf(current), {
+        ok: false,
+        at: Date.now(),
+        ...(quota ? { ttlMs: hardQuotaMs } : {}),
+      })
       ctx.logger?.warn?.(
         `${statePrefix}: ${keyOf(current)} 调用失败（${code}）`
-        + `${capacity ? '，该模型装不下当前上下文' : ''}，暂时移出轮换`,
+        + `${capacity ? '，该模型装不下当前上下文' : ''}`
+        + `${quota ? `，额度耗尽，隔离 ${Math.round(hardQuotaMs / 60_000)} 分钟` : '，暂时移出轮换'}`,
       )
     }
 

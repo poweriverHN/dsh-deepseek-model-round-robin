@@ -772,3 +772,60 @@ test('容量结论走缓存：连续两轮只问一次 resolveModelInfo', async 
   await h.fire(agentAt(FREE[0], sink))
   assert.strictEqual(log.infoCalls.length, afterFirst, '缓存命中后不该再问')
 })
+
+// ---------- 额度类失败的隔离期 ----------
+
+/** 让 TTL 到期：探测缓存 1ms，等 5ms 后必然过期。 */
+const SHORT_TTL = { verifyBeforeSwitch: false, verifyTtlMs: 1 }
+const waitExpiry = async () => { await new Promise(resolve => setTimeout(resolve, 5)) }
+
+/** 能既当失败方、又当轮换方的假 agent：当前模型由参数给定，select 记到 sink。 */
+function combinedAgent(selection, sink) {
+  return {
+    status: 'idle',
+    whenIdle: async () => {},
+    followup: () => {},
+    session: { ownEvents: () => [] },
+    model: {
+      current: () => selection,
+      select: value => { sink.picked = value },
+    },
+  }
+}
+
+test('QUOTA_EXCEEDED 走长隔离：探测 TTL 过期后仍然不回到轮换池', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  const h = harness({
+    llm: fakeLlm(() => 'ok'),
+    config: { ...SHORT_TTL, quotaQuarantineMs: 60_000 },
+  })
+  const sink = {}
+  // 在 LIST[0] 上失败，然后从 LIST[2] 往后轮换：正常顺序下一个是 LIST[0]
+  await h.fail(combinedAgent(LIST[0], {}), { code: 'QUOTA_EXCEEDED' })
+  await waitExpiry()
+  await h.fire(combinedAgent(LIST[2], sink))
+  assert.deepStrictEqual(sink.picked, LIST[1], '额度耗尽的模型应被隔离，轮换跳到下一个')
+})
+
+test('非额度类故障只按短 TTL 记账：过期后重新参与轮换', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  const h = harness({ llm: fakeLlm(() => 'ok'), config: SHORT_TTL })
+  const sink = {}
+  await h.fail(combinedAgent(LIST[0], {}), { code: 'SERVER' })
+  await waitExpiry()
+  await h.fire(combinedAgent(LIST[2], sink))
+  assert.deepStrictEqual(sink.picked, LIST[0], '抖动类故障不该长期隔离')
+})
+
+test('quotaQuarantineMs=0 时不隔离，回到短 TTL 行为', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  const h = harness({
+    llm: fakeLlm(() => 'ok'),
+    config: { ...SHORT_TTL, quotaQuarantineMs: 0 },
+  })
+  const sink = {}
+  await h.fail(combinedAgent(LIST[0], {}), { code: 'QUOTA' })
+  await waitExpiry()
+  await h.fire(combinedAgent(LIST[2], sink))
+  assert.deepStrictEqual(sink.picked, LIST[0], '0 表示不隔离，只是普通记账')
+})
