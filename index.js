@@ -37,60 +37,27 @@ const DEFAULT_STALE_MINUTES = 180
 const DEFAULT_EXCLUDE_PROVIDERS = ['deepseek-official', 'deepseek-account']
 
 /**
- * 「这个渠道/模型现在服务不了请求」的失败码。
+ * **不切换**的失败码——反过来列：除了这几类，任何失败都换下一个可用模型。
  *
- * 这张表有两类来源，**两套码并存**，漏掉任何一套都会让自动切换静默失效：
+ * 2026-11-20 用户要求「只要模型调用失败就换下一个可用模型」，所以判断从白名单
+ * 翻成黑名单。白名单的根本问题是：`error.code` 有**两套来源**（DSH 核心 `@deepseek-ai/dsh-llm`
+ * 的 `*_CODE` 常量、`dsh-our-free-model` 的 channel-pack 自建码），还有压根没有 code
+ * 的错误（`Unhandled Error`、`ToolBatchExecutionError`、会话写入失败）。想枚举全，
+ * 必然漏；漏一个就是「调用失败却原地不动」。
  *
- * 1. DSH 核心（`@deepseek-ai/dsh-llm` 的 `*_CODE` 常量）—— 注意常量名和值不一样：
- *    `QUOTA_EXCEEDED_CODE === 'QUOTA'`、`ACCOUNT_QUOTA_EXCEEDED_CODE === 'ACCOUNT_QUOTA'`、
- *    `EMPTY_RESPONSE_CODE === 'EMPTY_RESPONSE'`、`CONTEXT_WINDOW_EXCEEDED_CODE ===
- *    'CONTEXT_WINDOW_EXCEEDED'`。pi-ai 那条路把上游错误归一到这几个码
- *    （`classifyPiAiError` 返回 AUTH / QUOTA / RATE_LIMIT / INVALID_REQUEST /
- *    SERVER / TIMEOUT / TRANSPORT / PI_AI_ERROR）。
+ * 留在黑名单里的都是**换模型解决不了**的：
+ * - `ABORTED` / `APPROVAL_CANCELLED`：用户主动打断或拒绝审批，重跑等于强行继续
+ * - `TOOL_ACTIVATION_FAILED` / `TOOL_CONTEXT_UNAVAILABLE`：工具环境问题，与模型无关
  *
- * 2. `dsh-our-free-model` 的 channel-pack —— 它自建 `LlmError` 时用的是**自己的**码，
- *    其中 `QUOTA_EXCEEDED`（注意带后缀，与核心的 `QUOTA` 不同）是真实存在、真会被抛的：
- *    loomy、trae、qoder 等渠道额度耗尽时抛的就是它。2026-11-20 loomy 报
- *    「积分余额不足，请获取积分后再试 / QUOTA_EXCEEDED」正是此码——当时表里没有它，
- *    自动切换与回填全部没触发，只能人工换模型。
- *
- * 所以不要凭「DSH 里应该只有这些」删条目：pack 抛的码不在 DSH 核心码表里。
+ * 其余一律换模型。会不会死循环由 `autoRetryOnFailure`（默认 2）兜住：额度用完就
+ * 停下、把输入还回队列，不会无限重试。
  */
-const FAILURE_CODES = new Set([
-  // 额度与限流（核心 QUOTA / ACCOUNT_QUOTA，pack QUOTA_EXCEEDED）
-  'ACCOUNT_QUOTA',
-  'QUOTA',
-  'QUOTA_EXCEEDED',
-  'RATE_LIMIT',
-  // 凭据
-  'AUTH',
-  'ACCOUNT_SIGN_IN_REQUIRED',
-  'ACCOUNT_TOKEN_INVALID',
-  'MISSING_CREDENTIAL',
-  'NO_CREDENTIAL_STORE',
-  'INVALID_CREDENTIAL',
-  // 传输与服务端
-  'TRANSPORT',
-  'NETWORK',
-  'SERVER',
-  'TIMEOUT',
-  'STREAM_CLOSED',
-  'EMPTY_RESPONSE',
-  'MALFORMED_RESPONSE',
-  // 请求本身被拒（换模型常能过去：400 / 413 / 内容类型不支持）
-  'INVALID_REQUEST',
-  'UNSUPPORTED_CONTENT',
-  // 适配器与模型
-  'UNKNOWN_MODEL',
-  'NO_ADAPTER',
-  'INVALID_ADAPTER',
-  'MODEL_UNSUPPORTED',
-  'DUPLICATE_ADAPTER',
-  // 发现
-  'DISCOVERY_FAILED',
-  'DISCOVERY_UNSUPPORTED',
-  'NO_DISCOVERY',
-  'INVALID_DISCOVERY',
+const NO_SWITCH_CODES = new Set([
+  'ABORTED',
+  'TOOL_ABORTED',
+  'APPROVAL_CANCELLED',
+  'TOOL_ACTIVATION_FAILED',
+  'TOOL_CONTEXT_UNAVAILABLE',
 ])
 
 /**
@@ -110,7 +77,7 @@ const CAPACITY_CODES = new Set([
 /**
  * 额度耗尽的码（核心的 `QUOTA`/`ACCOUNT_QUOTA`、pack 的 `QUOTA_EXCEEDED`）。
  *
- * 与 {@link FAILURE_CODES} 的区别只在隔离时长：这些不是抖动，要人工充值才恢复，
+ * 与其它失败的区别只在隔离时长：这些不是抖动，要人工充值才恢复，
  * 用 15 分钟的探测 TTL 会让它反复回到轮换池，每轮都白失败一次。
  */
 const QUOTA_CODES = new Set([
@@ -568,11 +535,12 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 失败后的兜底处理。两类失败分开对待：
+   * 失败后的兜底处理。按「换模型能不能解决」分两类：
    *
-   * - **渠道/模型故障**（`FAILURE_CODES`）：换个确认可用的模型接着跑。
    * - **目标模型撑不住上下文**（`CAPACITY_CODES`）：继续往前轮换只会再撞一次，
    *   退回上一个真正提交过请求的模型。
+   * - **其它任何失败**（`NO_SWITCH_CODES` 之外）：一律换下一个确认可用的模型。
+   *   这里故意不做白名单——错误码有两套来源，枚举必漏，漏了就原地不动。
    *
    * 两者都是先换模型、再（有额度时）用同一轮历史自动重跑；额度用尽或换不到模型，
    * 才把输入放回队列让用户手工重发。
@@ -583,10 +551,11 @@ export function apply(ctx, config) {
    * 于是「回显到输入框」变成「消息凭空消失」。
    */
   async function handleFailure(agent, turn, error) {
-    const code = error?.failure?.code ?? error?.code
-    if (typeof code !== 'string') return
+    const raw = error?.failure?.code ?? error?.code
+    // 有些错误根本没有 code（Unhandled Error / 会话写入失败）：归到 UNKNOWN 照样换模型
+    const code = typeof raw === 'string' && raw !== '' ? raw : 'UNKNOWN'
+    if (NO_SWITCH_CODES.has(code)) return
     const capacity = CAPACITY_CODES.has(code)
-    if (!capacity && !FAILURE_CODES.has(code)) return
 
     const current = agent.model?.current?.()
     const currentKnown = current !== undefined && typeof current.provider === 'string' && typeof current.model === 'string'

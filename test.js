@@ -348,15 +348,15 @@ test('渠道级故障会把该模型记账为不可用，下轮避开', async ()
   assert.ok(!log.calls.includes('trae/DeepSeek-V4-Pro'), '已知坏的渠道不会再被探测或选中')
 })
 
-test('非渠道级错误不会错杀健康模型', async () => {
+test('取消类错误不会错杀健康模型', async () => {
   writeWhitelist({ at: Date.now(), models: LIST })
   const log = { calls: [] }
   const h = harness({ llm: fakeLlm(() => 'ok', log) })
-  await h.fail(agentAt(FREE[1], {}), { code: 'TOOL_FAILED' })
+  await h.fail(agentAt(FREE[1], {}), { code: 'ABORTED' })
   log.calls.length = 0
   const sink = {}
   await h.fire(agentAt(FREE[0], sink))
-  assert.deepStrictEqual(sink.picked, FREE[1], '工具报错不该影响轮换判断')
+  assert.deepStrictEqual(sink.picked, FREE[1], '用户打断不该影响轮换判断')
 })
 
 test('select 抛错被吞掉，不炸掉对话', async () => {
@@ -391,11 +391,11 @@ test('消息已经写进日志时不重复入队', async () => {
   assert.strictEqual(agent.appended.length, 0)
 })
 
-test('非渠道级错误不动用户输入', async () => {
+test('取消类错误不动用户输入', async () => {
   const h = harness({ config: { autoRetryOnFailure: 0 } })
   const agent = recoverableAgent()
   h.claim(agent, userMessage())
-  await h.fail(agent, { code: 'TOOL_FAILED' })
+  await h.fail(agent, { code: 'ABORTED' })
   assert.strictEqual(agent.appended.length, 0)
 })
 
@@ -567,7 +567,7 @@ test('换不到可用模型时回落到回填输入', async () => {
   assert.strictEqual(agent.appended.length, 1, '换不到模型也不能把输入丢掉')
 })
 
-test('非渠道级错误不触发自动重跑', async () => {
+test('取消类错误不触发自动重跑', async () => {
   writeWhitelist({ at: Date.now(), models: LIST })
   const h = harness({ llm: fakeLlm(() => 'ok') })
   const agent = Object.assign(agentAt(FREE[0], {}), {
@@ -576,7 +576,7 @@ test('非渠道级错误不触发自动重跑', async () => {
     followups: [],
     followup: message => { agent.followups.push(message) },
   })
-  await h.fail(agent, { code: 'TOOL_FAILED' })
+  await h.fail(agent, { code: 'APPROVAL_CANCELLED' })
   assert.strictEqual(agent.followups.length, 0)
 })
 
@@ -666,9 +666,11 @@ test('真实码生效：核心的 QUOTA 与 pack 的 QUOTA_EXCEEDED 都算渠道
   assert.strictEqual(agent2.followups.length, 1, '并且用同一轮历史自动重跑，不需要人工“继续”')
 })
 
-test('从未在 DSH 出现过的码不误伤：RATE_LIMITED / UNAUTHORIZED 之类仍然不处理', async () => {
-  const h = harness({ llm: fakeLlm(() => 'ok') })
-  for (const code of ['RATE_LIMITED', 'UNAUTHORIZED', 'UNAVAILABLE', 'NO_CREDENTIAL']) {
+test('不认识的码也照样换下一个：判断是黑名单，不是白名单', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  // 这些码在 DSH 里根本不存在，但「枚举不全就原地不动」的代价太大，
+  // 所以任何没被显式排除的码都必须触发切换。
+  for (const code of ['RATE_LIMITED', 'UNAUTHORIZED', 'UNAVAILABLE', 'NO_CREDENTIAL', 'SOMETHING_NEW']) {
     const sink = {}
     const agent = Object.assign(agentAt(FREE[0], sink), {
       status: 'idle',
@@ -676,8 +678,36 @@ test('从未在 DSH 出现过的码不误伤：RATE_LIMITED / UNAUTHORIZED 之�
       followups: [],
       followup: () => {},
     })
+    await harness({ llm: fakeLlm(() => 'ok') }).fail(agent, { code })
+    assert.deepStrictEqual(sink.picked, FREE[1], `${code} 应当触发切换`)
+  }
+})
+
+test('完全没有 code 的错误（Unhandled Error / 会话写入失败）也换模型', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  const sink = {}
+  const agent = Object.assign(agentAt(FREE[0], sink), {
+    status: 'idle',
+    whenIdle: async () => {},
+    followups: [],
+    followup: message => { agent.followups.push(message) },
+  })
+  // 真实载荷：非 LlmError 时 error 是普通 Error，没有 failure、也没有 code
+  await harness({ llm: fakeLlm(() => 'ok') }).fail(agent, new Error('boom'))
+  assert.deepStrictEqual(sink.picked, FREE[1], '没有 code 也要换')
+})
+
+test('取消类失败不换模型、不回填：那是用户自己打断的', async () => {
+  writeWhitelist({ at: Date.now(), models: LIST })
+  for (const code of ['ABORTED', 'APPROVAL_CANCELLED', 'TOOL_ACTIVATION_FAILED']) {
+    const sink = {}
+    const agent = Object.assign(recoverableAgent(), agentAt(FREE[0], sink))
+    const h = harness({ llm: fakeLlm(() => 'ok'), config: { autoRetryOnFailure: 0 } })
+    h.claim(agent, userMessage())
     await h.fail(agent, { code })
-    assert.strictEqual(sink.picked, undefined, `${code} 不该触发任何动作`)
+    assert.strictEqual(sink.picked, undefined, `${code} 不该切换模型`)
+    assert.strictEqual(agent.appended.length, 0, `${code} 不该把输入塞回队列`)
+    assert.strictEqual(agent.followups.length, 0, `${code} 不该自动重跑`)
   }
 })
 
